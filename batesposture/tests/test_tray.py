@@ -193,12 +193,13 @@ def test_database_open_failure_disables_logging(qapp, tmp_path, monkeypatch):
 def test_save_to_db_uses_elapsed_interval_for_scheduled_tracking():
     saved = []
     fake_db = SimpleNamespace(
-        save_pose_data=lambda pose, score: saved.append((pose, score))
+        save_pose_data=lambda pose, score, mode=None: saved.append((pose, score, mode))
     )
     fake_tray = SimpleNamespace(
         _database=fake_db,
         _settings=SimpleNamespace(
-            runtime=SimpleNamespace(db_write_interval_seconds=300)
+            runtime=SimpleNamespace(db_write_interval_seconds=300),
+            profile=SimpleNamespace(active_mode="sit"),
         ),
         last_db_save=None,
     )
@@ -225,14 +226,18 @@ def test_save_to_db_uses_elapsed_interval_for_scheduled_tracking():
         tray_module.PostureTrackerTray._save_to_db(fake_tray, 81.0, bundle)
         tray_module.PostureTrackerTray._save_to_db(fake_tray, 82.0, bundle)
 
-    assert saved == [("pose-landmarks", 80.0), ("pose-landmarks", 82.0)]
+    assert saved == [
+        ("pose-landmarks", 80.0, "sit"),
+        ("pose-landmarks", 82.0, "sit"),
+    ]
 
 
 def test_failed_database_write_does_not_advance_save_cooldown():
     fake_tray = SimpleNamespace(
-        _database=SimpleNamespace(save_pose_data=lambda pose, score: False),
+        _database=SimpleNamespace(save_pose_data=lambda pose, score, mode=None: False),
         _settings=SimpleNamespace(
-            runtime=SimpleNamespace(db_write_interval_seconds=300)
+            runtime=SimpleNamespace(db_write_interval_seconds=300),
+            profile=SimpleNamespace(active_mode="sit"),
         ),
         last_db_save=None,
     )
@@ -272,6 +277,7 @@ def test_tracking_pauses_after_human_absence_grace_period(qapp, tmp_path, monkey
 
 def test_tracking_resumes_when_human_returns(qapp, tmp_path, monkeypatch):
     tray, settings, detector, camera, scores = _build_tray(tmp_path, monkeypatch)
+    settings.update_profile(prompt_on_return=False)
     tray.tracking_enabled = True
     tray._tracking_paused_for_absence = True
     tray._absence_started_at = datetime(2026, 1, 1, 12, 0, 0)

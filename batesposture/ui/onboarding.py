@@ -36,6 +36,10 @@ class CalibrationResult:
     neck_angle: float
     shoulder_delta: float
     sample_count: int = 0
+    spine_angle: float = 10.0
+    mid_shoulder_y: float = 0.45
+    shoulder_width: float = 0.25
+    hip_visibility: float = 0.0
 
 
 class CameraPreviewWidget(QLabel):
@@ -152,6 +156,10 @@ class CalibrationWorker(QObject):
                 "posture_score": [],
                 "neck_angle": [],
                 "shoulder_delta": [],
+                "spine_angle": [],
+                "mid_shoulder_y": [],
+                "shoulder_width": [],
+                "hip_visibility": [],
             }
 
             while not self._stop and time.monotonic() - start_time < self._duration:
@@ -179,6 +187,10 @@ class CalibrationWorker(QObject):
                 collected["shoulder_delta"].append(
                     metrics.get("shoulder_vertical_delta", 0.0)
                 )
+                collected["spine_angle"].append(metrics.get("spine_angle", 10.0))
+                collected["mid_shoulder_y"].append(metrics.get("mid_shoulder_y", 0.45))
+                collected["shoulder_width"].append(metrics.get("shoulder_width", 0.25))
+                collected["hip_visibility"].append(metrics.get("hip_visibility", 0.0))
                 self.progress_changed.emit(
                     min(99, int(elapsed / self._duration * 100)),
                     remaining,
@@ -216,6 +228,10 @@ class CalibrationWorker(QObject):
                 sum(collected["shoulder_delta"]) / len(collected["shoulder_delta"])
             ),
             sample_count=len(collected["posture_score"]),
+            spine_angle=float(sum(collected["spine_angle"]) / len(collected["spine_angle"])),
+            mid_shoulder_y=float(sum(collected["mid_shoulder_y"]) / len(collected["mid_shoulder_y"])),
+            shoulder_width=float(sum(collected["shoulder_width"]) / len(collected["shoulder_width"])),
+            hip_visibility=float(sum(collected["hip_visibility"]) / len(collected["hip_visibility"])),
         )
         self.finished.emit(result)
 
@@ -223,9 +239,15 @@ class CalibrationWorker(QObject):
 class WelcomePage(QWizardPage):
     """Opening wizard page — introduces the three-step onboarding flow."""
 
-    def __init__(self, icon_path: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        icon_path: str,
+        parent: QWidget | None = None,
+        mode: str = "sit",
+    ) -> None:
         super().__init__(parent)
-        self.setTitle(self.tr("Welcome"))
+        self._mode = mode
+        self.setTitle(self.tr("Standing baseline") if mode == "stand" else self.tr("Welcome"))
         self.setSubTitle(
             self.tr("A short calibration personalizes your posture score.")
         )
@@ -251,6 +273,10 @@ class WelcomePage(QWizardPage):
 
         hero = QLabel(
             self.tr(
+                "Stand the way you work while BatesPosture learns your neutral alignment. Your camera stays local to this device."
+            )
+            if self._mode == "stand"
+            else self.tr(
                 "Sit naturally while BatesPosture learns your neutral alignment. Your camera stays local to this device."
             )
         )
@@ -388,6 +414,23 @@ class CalibrationPage(QWizardPage):
         self._worker: CalibrationWorker | None = None
         self._metrics: CalibrationResult | None = None
         self._timeout: QTimer | None = None
+        self._mode = "sit"
+
+    def set_mode(self, mode: str) -> None:
+        self._mode = mode
+        if mode == "stand":
+            self.setSubTitle(
+                self.tr("Hold your usual standing-desk stance for a short sample.")
+            )
+            self.status_label.setText(
+                self.tr('When you\'re ready, stand comfortably and press "Start calibration".')
+            )
+        else:
+            self.setSubTitle(
+                self.tr(
+                    "We'll measure a short sample so posture insights match your neutral stance."
+                )
+            )
 
     def initializePage(self) -> None:  # noqa: N802 - Qt override
         self.preview.start(self._settings.runtime.default_camera_id)
@@ -541,19 +584,30 @@ class CalibrationPage(QWizardPage):
 
 class OnboardingWizard(QWizard):
     def __init__(
-        self, settings_service: SettingsService, parent: QWidget | None = None
+        self,
+        settings_service: SettingsService,
+        parent: QWidget | None = None,
+        mode: str = "sit",
     ) -> None:
         super().__init__(parent)
         self._settings = settings_service
-        self.setWindowTitle(self.tr("BatesPosture Setup"))
+        self._mode = mode if mode in {"sit", "stand"} else "sit"
+        self.setWindowTitle(
+            self.tr("BatesPosture Standing Setup")
+            if self._mode == "stand"
+            else self.tr("BatesPosture Setup")
+        )
         self.setOption(QWizard.WizardOption.IndependentPages, False)
         self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
         self.setMinimumSize(560, 600)
         self.resize(620, 680)
 
-        self.welcome_page = WelcomePage(settings_service.resources.icon_path)
+        self.welcome_page = WelcomePage(
+            settings_service.resources.icon_path, mode=self._mode
+        )
         self.camera_page = CameraSetupPage(settings_service)
         self.calibration_page = CalibrationPage(settings_service)
+        self.calibration_page.set_mode(self._mode)
 
         self._welcome_page_id = self.addPage(self.welcome_page)
         self._camera_page_id = self.addPage(self.camera_page)
@@ -571,12 +625,33 @@ class OnboardingWizard(QWizard):
     def accept(self) -> None:
         metrics = self.calibration_page.metrics()
         if metrics:
-            self._settings.update_profile(
-                has_completed_onboarding=True,
-                baseline_posture_score=metrics.posture_score,
-                baseline_neck_angle=metrics.neck_angle,
-                baseline_shoulder_level=metrics.shoulder_delta,
+            from ..services.posture_mode import coerce_baseline
+
+            baseline = coerce_baseline(
+                {
+                    "posture_score": metrics.posture_score,
+                    "neck_angle": metrics.neck_angle,
+                    "shoulder_delta": metrics.shoulder_delta,
+                    "spine_angle": metrics.spine_angle,
+                    "mid_shoulder_y": metrics.mid_shoulder_y,
+                    "shoulder_width": metrics.shoulder_width,
+                    "hip_visibility": metrics.hip_visibility,
+                    "sample_count": metrics.sample_count,
+                    "calibrated": True,
+                }
             )
+            updates = {
+                "has_completed_onboarding": True,
+                "active_mode": self._mode,
+                "baseline_posture_score": metrics.posture_score,
+                "baseline_neck_angle": metrics.neck_angle,
+                "baseline_shoulder_level": metrics.shoulder_delta,
+            }
+            if self._mode == "stand":
+                updates["stand_baseline"] = baseline
+            else:
+                updates["sit_baseline"] = baseline
+            self._settings.update_profile(**updates)
         self._stop_camera_activity()
         super().accept()
 
@@ -598,8 +673,9 @@ def run_onboarding_if_needed(
     settings_service: SettingsService,
     parent: QWidget | None = None,
     force: bool = False,
+    mode: str = "sit",
 ) -> bool:
     if settings_service.profile.has_completed_onboarding and not force:
         return False
-    wizard = OnboardingWizard(settings_service, parent)
+    wizard = OnboardingWizard(settings_service, parent, mode=mode)
     return wizard.exec() == QDialog.DialogCode.Accepted

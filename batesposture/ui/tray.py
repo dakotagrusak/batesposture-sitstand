@@ -20,6 +20,15 @@ from ..services.camera_capture import discover_camera_ids
 from ..services.camera_service import CameraService
 from ..services.notification_service import NotificationService
 from ..services.score_service import ScoreService
+from ..services.posture_mode import (
+    DeskMode,
+    FramingSnapshot,
+    baseline_is_calibrated,
+    coerce_baseline,
+    normalize_mode,
+    score_against_baseline,
+    suggest_mode,
+)
 from ..services.settings_service import (
     BREAK_REMINDER_MINUTES,
     SettingsService,
@@ -84,6 +93,8 @@ class PostureTrackerTray(QSystemTrayIcon):
         self._onboarding_completed_this_run = False
         self._onboarding_cancelled = False
         self._open_dashboard_on_first_tracking = False
+        self._mode_prompt_open = False
+        self._pending_return_prompt = False
 
         self._initialize_application()
         self._run_onboarding_if_needed()
@@ -151,6 +162,9 @@ class PostureTrackerTray(QSystemTrayIcon):
         menu.addAction(self.toggle_tracking_action)
         menu.addAction(self.toggle_dashboard_action)
 
+        self.mode_menu = self._create_mode_menu(menu)
+        self.mode_menu_action = menu.addMenu(self.mode_menu)
+
         self.interval_menu = self._create_interval_menu(menu)
         self.interval_menu.setIcon(
             style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
@@ -159,6 +173,9 @@ class PostureTrackerTray(QSystemTrayIcon):
         if self._onboarding_cancelled:
             self.toggle_tracking_action.setEnabled(False)
             self.interval_menu_action.setEnabled(False)
+            if hasattr(self, "mode_menu_action"):
+                self.mode_menu_action.setEnabled(False)
+            self.mode_menu_action.setEnabled(False)
 
         runtime = self._settings.runtime
         menu.addSection("Quick toggles")
@@ -247,6 +264,43 @@ class PostureTrackerTray(QSystemTrayIcon):
             if minutes == self.tracking_interval:
                 action.setChecked(True)
         return interval_menu
+
+    def _create_mode_menu(self, parent_menu: QMenu) -> QMenu:
+        mode_menu = QMenu("Desk Mode", parent_menu)
+        group = QActionGroup(mode_menu)
+        group.setExclusive(True)
+        active = normalize_mode(self._settings.profile.active_mode)
+
+        self.sit_mode_action = QAction("Sitting", mode_menu, checkable=True)
+        self.sit_mode_action.setShortcut("Ctrl+Alt+1")
+        self.sit_mode_action.setData(DeskMode.SIT.value)
+        self.sit_mode_action.triggered.connect(lambda: self._choose_mode(DeskMode.SIT.value))
+        group.addAction(self.sit_mode_action)
+        mode_menu.addAction(self.sit_mode_action)
+
+        self.stand_mode_action = QAction("Standing", mode_menu, checkable=True)
+        self.stand_mode_action.setShortcut("Ctrl+Alt+2")
+        self.stand_mode_action.setData(DeskMode.STAND.value)
+        self.stand_mode_action.triggered.connect(lambda: self._choose_mode(DeskMode.STAND.value))
+        group.addAction(self.stand_mode_action)
+        mode_menu.addAction(self.stand_mode_action)
+
+        self.sit_mode_action.setChecked(active == DeskMode.SIT.value)
+        self.stand_mode_action.setChecked(active == DeskMode.STAND.value)
+
+        mode_menu.addSeparator()
+        self.recalibrate_mode_action = QAction("Recalibrate this mode…", mode_menu)
+        self.recalibrate_mode_action.setShortcut("Ctrl+Alt+R")
+        self.recalibrate_mode_action.triggered.connect(self._recalibrate_active_mode)
+        mode_menu.addAction(self.recalibrate_mode_action)
+
+        self.prompt_on_return_action = QAction(
+            "Prompt when I sit back down", mode_menu, checkable=True
+        )
+        self.prompt_on_return_action.setChecked(self._settings.profile.prompt_on_return)
+        self.prompt_on_return_action.triggered.connect(self._toggle_prompt_on_return)
+        mode_menu.addAction(self.prompt_on_return_action)
+        return mode_menu
 
     def _setup_signal_handling(self) -> None:
         import signal
@@ -386,17 +440,20 @@ class PostureTrackerTray(QSystemTrayIcon):
 
         self._absence_started_at = None
         if self._tracking_paused_for_absence:
-            self._resume_tracking_after_presence()
+            self._resume_tracking_after_presence(results_bundle.metrics)
         if isinstance(self.video_window, PostureDashboard):
             self.video_window.set_tracking_state("tracking")
 
-        self._scores.add_score(score)
+        metrics: dict | None = results_bundle.metrics
+        logged_score = score
+        baseline = self._active_baseline()
+        if metrics and baseline_is_calibrated(baseline):
+            logged_score = score_against_baseline(metrics, baseline)
+        self._scores.add_score(logged_score)
         average_score, stats = self._scores.average_and_stats()
         if abs(average_score - self._last_icon_score) >= 1.0:
             self.setIcon(create_score_icon(average_score))
             self._last_icon_score = average_score
-
-        metrics: dict[str, float] | None = results_bundle.metrics
 
         if self._database and self._settings.runtime.enable_database_logging:
             self._save_to_db(average_score, results_bundle)
@@ -439,13 +496,17 @@ class PostureTrackerTray(QSystemTrayIcon):
         self._last_icon_score = -1.0
         logger.info("Human no longer detected; paused tracking")
 
-    def _resume_tracking_after_presence(self) -> None:
+    def _resume_tracking_after_presence(self, metrics: dict | None = None) -> None:
         self._tracking_paused_for_absence = False
-        self._scores.resume_session()
         self._continuous_tracking_start = datetime.now()
         self._break_reminder_sent = False
         self.last_db_save = None
         logger.info("Human detected again; resumed tracking")
+        if self._settings.profile.prompt_on_return:
+            self._pending_return_prompt = True
+            self._prompt_mode_on_return(metrics)
+        else:
+            self._scores.resume_session()
 
     def _update_tooltip(self, average_score: float) -> None:
         grade = score_grade(average_score)
@@ -547,7 +608,11 @@ class PostureTrackerTray(QSystemTrayIcon):
             return
         pose_results = results_bundle.pose_landmarks
         if pose_results:
-            saved = self._database.save_pose_data(pose_results, average_score)
+            saved = self._database.save_pose_data(
+                pose_results,
+                average_score,
+                mode=normalize_mode(self._settings.profile.active_mode),
+            )
             if saved is not False:
                 self.last_db_save = current_time
 
@@ -606,20 +671,109 @@ class PostureTrackerTray(QSystemTrayIcon):
         if dialog.exec() == QDialog.DialogCode.Accepted:  # type: ignore
             self._refresh_after_settings_change()
             if dialog.recalibration_requested:
-                self._run_recalibration()
+                self._run_recalibration(mode=self._settings.profile.active_mode)
 
-    def _run_recalibration(self) -> None:
+    def _recalibrate_active_mode(self) -> None:
+        self._run_recalibration(mode=normalize_mode(self._settings.profile.active_mode))
+
+    def _toggle_prompt_on_return(self, checked: bool) -> None:
+        self._settings.update_profile(prompt_on_return=checked)
+
+    def _active_baseline(self) -> dict:
+        profile = self._settings.profile
+        mode = normalize_mode(profile.active_mode)
+        raw = profile.stand_baseline if mode == DeskMode.STAND.value else profile.sit_baseline
+        return coerce_baseline(raw)
+
+    def _sync_mode_actions(self) -> None:
+        mode = normalize_mode(self._settings.profile.active_mode)
+        if hasattr(self, "sit_mode_action"):
+            self.sit_mode_action.setChecked(mode == DeskMode.SIT.value)
+            self.stand_mode_action.setChecked(mode == DeskMode.STAND.value)
+
+    def _choose_mode(self, mode: str, skip_prompt_reset: bool = False) -> None:
+        mode = normalize_mode(mode)
+        profile = self._settings.profile
+        baseline = (
+            coerce_baseline(profile.stand_baseline)
+            if mode == DeskMode.STAND.value
+            else coerce_baseline(profile.sit_baseline)
+        )
+        if not baseline_is_calibrated(baseline):
+            self._run_recalibration(mode=mode)
+            return
+        message = (
+            "Stand tall."
+            if mode == DeskMode.STAND.value
+            else "Please sit up straight!"
+        )
+        self._settings.update_profile(
+            active_mode=mode,
+            baseline_posture_score=float(baseline["posture_score"]),
+            baseline_neck_angle=float(baseline["neck_angle"]),
+            baseline_shoulder_level=float(baseline["shoulder_delta"]),
+        )
+        self._settings.update_runtime(default_posture_message=message)
+        self._pending_return_prompt = False
+        self._sync_mode_actions()
+        if self.tracking_enabled:
+            self._scores.resume_session()
+
+    def _prompt_mode_on_return(self, metrics: dict | None) -> None:
+        if self._mode_prompt_open:
+            return
+        suggested = suggest_mode(
+            FramingSnapshot.from_metrics(metrics),
+            self._settings.profile.sit_baseline,
+            self._settings.profile.stand_baseline,
+        )
+        if not self._settings.profile.prompt_on_return:
+            self._choose_mode(self._settings.profile.active_mode)
+            return
+        guess = {DeskMode.SIT: "Sitting", DeskMode.STAND: "Standing"}.get(
+            suggested, "your last mode"
+        )
+        self._mode_prompt_open = True
+        try:
+            box = QMessageBox()
+            box.setWindowTitle("BatesPosture")
+            box.setText(f"You're back. Start which session?\nSuggested: {guess}")
+            sit_btn = box.addButton("Sitting", QMessageBox.ButtonRole.AcceptRole)
+            stand_btn = box.addButton("Standing", QMessageBox.ButtonRole.AcceptRole)
+            rec_btn = box.addButton("Recalibrate…", QMessageBox.ButtonRole.ActionRole)
+            box.addButton("Keep last mode", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is sit_btn:
+                self._choose_mode(DeskMode.SIT.value)
+            elif clicked is stand_btn:
+                self._choose_mode(DeskMode.STAND.value)
+            elif clicked is rec_btn:
+                self._recalibrate_active_mode()
+            else:
+                self._choose_mode(self._settings.profile.active_mode)
+        finally:
+            self._mode_prompt_open = False
+
+    def _run_recalibration(self, mode: str | None = None) -> None:
         was_tracking = self.tracking_enabled
         dashboard_was_open = self.video_window is not None
         if was_tracking:
             self._stop_tracking()
-        accepted = run_onboarding_if_needed(self._settings, force=True)
+        accepted = run_onboarding_if_needed(
+            self._settings,
+            force=True,
+            mode=normalize_mode(mode or self._settings.profile.active_mode),
+        )
         if accepted:
             self._onboarding_cancelled = False
             self._auto_schedule_enabled = True
             self._open_dashboard_on_first_tracking = True
             self.toggle_tracking_action.setEnabled(True)
             self.interval_menu_action.setEnabled(True)
+            if hasattr(self, "mode_menu_action"):
+                self.mode_menu_action.setEnabled(True)
+            self._sync_mode_actions()
             self.showMessage(
                 "Calibration updated",
                 "Your new baseline is ready. Tracking is starting now.",
@@ -635,6 +789,8 @@ class PostureTrackerTray(QSystemTrayIcon):
             self._auto_schedule_enabled = False
             self.toggle_tracking_action.setEnabled(False)
             self.interval_menu_action.setEnabled(False)
+            if hasattr(self, "mode_menu_action"):
+                self.mode_menu_action.setEnabled(False)
 
     def _refresh_after_settings_change(self) -> None:
         runtime = self._settings.runtime
@@ -656,6 +812,7 @@ class PostureTrackerTray(QSystemTrayIcon):
             )
             if self._onboarding_cancelled:
                 self.interval_menu_action.setEnabled(False)
+            self._sync_mode_actions()
 
         with self._camera_service.pause_processing():
             self._camera_service.reload_settings()

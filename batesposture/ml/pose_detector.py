@@ -104,7 +104,10 @@ class PoseDetector:
                 points = np.array(
                     [[lm.x, lm.y, lm.z] for lm in results.pose_landmarks.landmark]
                 )
-                metrics = self._compute_posture_metrics_from_points(points)
+                visibility = np.array(
+                    [getattr(lm, "visibility", 1.0) for lm in results.pose_landmarks.landmark]
+                )
+                metrics = self._compute_posture_metrics_from_points(points, visibility)
                 posture_score = metrics["posture_score"]
                 self._draw_landmarks(frame, results, points)
                 self._draw_posture_feedback(frame, posture_score)
@@ -179,10 +182,13 @@ class PoseDetector:
 
     def _compute_posture_metrics(self, landmarks: Any) -> dict[str, float]:
         points = np.array([[lm.x, lm.y, lm.z] for lm in landmarks.landmark])
-        return self._compute_posture_metrics_from_points(points)
+        visibility = np.array(
+            [getattr(lm, "visibility", 1.0) for lm in landmarks.landmark]
+        )
+        return self._compute_posture_metrics_from_points(points, visibility)
 
     def _compute_posture_metrics_from_points(
-        self, points: np.ndarray
+        self, points: np.ndarray, visibility: np.ndarray | None = None
     ) -> dict[str, float]:
         nose = points[self.mp_pose.PoseLandmark.NOSE]
         ears = points[
@@ -255,6 +261,13 @@ class PoseDetector:
             ]
         )
         posture_score = float(np.clip(np.dot(scores, self.weights) * 100, 0, 100))
+        left_hip = self.mp_pose.PoseLandmark.LEFT_HIP
+        right_hip = self.mp_pose.PoseLandmark.RIGHT_HIP
+        if visibility is not None and visibility.shape[0] > int(right_hip):
+            hip_visibility = float((visibility[int(left_hip)] + visibility[int(right_hip)]) * 0.5)
+        else:
+            hip_visibility = 1.0 if mid_hip[1] > mid_shoulder[1] else 0.0
+
         return {
             "posture_score": posture_score,
             "neck_angle": float(neck_angle),
@@ -263,6 +276,9 @@ class PoseDetector:
             "head_tilt_score": float(head_tilt_score),
             "neck_vertical_score": float(neck_vertical_score),
             "spine_alignment_score": float(spine_alignment_score),
+            "mid_shoulder_y": float(mid_shoulder[1]),
+            "shoulder_width": float(np.linalg.norm(shoulders[1] - shoulders[0])),
+            "hip_visibility": hip_visibility,
         }
 
     def _calculate_posture_score(self, landmarks: Any) -> float:

@@ -6,10 +6,10 @@
 
 [![Checks](https://github.com/wtbates99/batesposture/actions/workflows/data-checks.yml/badge.svg)](https://github.com/wtbates99/batesposture/actions/workflows/data-checks.yml)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![MediaPipe](https://img.shields.io/badge/pose-MediaPipe-e07830)](https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker)
+[![MediaPipe](https://img.shields.io/badge/pose-MediaPipe-e07830)](https://developers.google.com/edge/mediapipe/solutions/vision/pose_landmarker)
 [![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial-c9a84c)](LICENSE)
 
-[**Install**](#install) · [**How it works**](#how-it-works) · [**Privacy**](#privacy) · [**License**](#license)
+[**Install**](#install) · [**How it works**](#how-it-works) · [**Goals**](#goals) · [**vs. SitSense**](#batesposture-vs-sitsense) · [**Privacy**](#privacy) · [**License**](#license)
 
 </div>
 
@@ -19,6 +19,30 @@ BatesPosture watches a webcam locally, scores posture from 0–100, and sends a
 native notification when posture drops below a personal threshold. Calibration
 tunes the measurements to the person using the app. There are no accounts,
 cloud uploads, or telemetry.
+
+## Fork notice
+
+This fork builds on the original [`wtbates99/batesposture`](https://github.com/wtbates99/batesposture)
+by William Bates, which established the core tray app: MediaPipe-driven pose
+scoring, calibration, the dashboard, notifications, scheduling, and SQLite/CSV
+logging. Everything in **What it provides**, **How it works**, and **Privacy**
+below describes that original design except where noted.
+
+This fork adds:
+
+- **Sit / stand desk modes** — separate calibrated baselines for sitting and
+  standing, a tray **Desk Mode** menu, hotkeys (`Ctrl+Alt+1` sit,
+  `Ctrl+Alt+2` stand, `Ctrl+Alt+R` recalibrate), a prompt when you return to
+  the desk asking which mode to resume in, and a `mode` column on logged
+  scores and CSV exports. See [`CLAUDE_SIT_STAND.md`](CLAUDE_SIT_STAND.md)
+  for the full technical rundown and [`sit-stand.patch`](sit-stand.patch) for
+  the diff against upstream.
+- Bug fixes uncovered while wiring that feature up: a presence-debounce edge
+  case that could never confirm on a zero-second threshold, a return-prompt
+  dialog that could block indefinitely, and stale test fixtures.
+
+It intentionally does **not** add a sit/stand classifier — the webcam framing
+can only hint which mode you're in, and the user confirms.
 
 ## What it provides
 
@@ -32,6 +56,7 @@ cloud uploads, or telemetry.
 | Local history | Optional SQLite logging and CSV export |
 | Adaptive processing | Frame-size and performance controls for slower hardware |
 | Auto-pause | Away-from-desk time is excluded when no person is detected |
+| Sit / stand modes | Separate sitting and standing baselines, tray switch, return prompt, CSV `mode` column |
 
 ![BatesPosture onboarding calibration screen using a synthetic preview](docs/assets/onboarding.png)
 
@@ -40,7 +65,7 @@ cloud uploads, or telemetry.
 Requires Python 3.10 or newer, [uv](https://docs.astral.sh/uv/), and a webcam.
 
 ```bash
-git clone https://github.com/wtbates99/batesposture.git
+git clone https://github.com/dakotagrusak/batesposture.git
 cd batesposture
 uv sync --locked --all-groups
 uv run batesposture
@@ -68,11 +93,72 @@ GNOME users may also need an AppIndicator extension for the tray icon.
 
 ## How it works
 
-1. **Calibrate** — capture a six-second baseline of the user's natural posture.
-2. **Track** — MediaPipe landmarks feed seven geometric measurements.
-3. **Score** — weighted measurements produce one 0–100 posture score.
-4. **Alert** — a sustained low score triggers a cooldown-controlled notification.
-5. **Review** — the dashboard shows the current session and optional saved history.
+1. **Calibrate** — capture a six-second baseline of the user's natural
+   posture, per desk mode (sit / stand).
+2. **Track** — MediaPipe Pose Landmarker locates 33 body landmarks per frame;
+   seven of them feed geometric posture measurements.
+3. **Score** — weighted measurements are compared against the active mode's
+   baseline to produce one 0–100 posture score.
+4. **Alert** — a sustained low score triggers a cooldown-controlled
+   notification; stepping away and coming back triggers a mode-resume prompt.
+5. **Review** — the dashboard shows the current session and optional saved
+   history.
+
+## Why MediaPipe
+
+Pose detection uses Google's [MediaPipe Pose
+Landmarker](https://developers.google.com/edge/mediapipe/solutions/vision/pose_landmarker),
+which is itself a neural network: **BlazePose**, a convolutional network with
+a MobileNetV2-style backbone, refined by GHUM, Google's 3D human shape model.
+It runs entirely on-device — no frame ever needs a network call — and returns
+33 3D body landmarks (shoulders, hips, ears, elbows, etc.) per frame.
+
+BatesPosture does not train or ship its own pose-estimation model. It takes
+MediaPipe's landmark output and layers a deterministic, transparent scoring
+step on top: seven geometric measurements (neck angle, spine angle, shoulder
+tilt, framing distance, and related metrics) are weighted and compared
+against the user's calibrated baseline for the active desk mode. That scoring
+function is a fixed formula, not a learned model — the six-second calibration
+step is what personalizes it to a given body and desk setup, not training
+data.
+
+## Goals
+
+BatesPosture's direction is **prompt-based posture correction**: rather than
+only reporting a score after the fact, use what the webcam already sees —
+sustained slouching, a mode change, time away from the desk — to nudge the
+user in the moment, with feedback specific enough to act on immediately. The
+sit/stand return-prompt in this fork ("You're back — Sitting / Standing /
+Recalibrate / Keep last mode?") is a first step in that direction. Longer
+term, the goal is to reduce the physical fatigue and health cost of long
+stretches in front of a screen — neck and back strain, eye fatigue, reduced
+circulation from static sitting — with timely, local, low-friction nudges
+rather than a dashboard nobody checks.
+
+## `BatesPosture` vs. SitSense
+
+[SitSense](https://www.sitsense.app/about) is a comparable posture-tracking
+product, shipped as a browser extension. Based on its public "About" page,
+here's how the two compare:
+
+| | BatesPosture | SitSense |
+| --- | --- | --- |
+| Form factor | Native desktop app (tray icon) | Chrome extension |
+| Where video is processed | Locally, on-device | Locally, in-browser (per SitSense's own privacy claims) |
+| Pose model | MediaPipe Pose Landmarker (BlazePose CNN, on-device, open and documented) | Unspecified — SitSense does not publish model architecture or provider |
+| Posture scoring | Deterministic geometric formula over landmark angles, weighted and thresholded, fully inspectable in source | Not published; likely model-driven given no disclosed scoring formula |
+| Calibration | ~6-second guided baseline per desk mode (sit / stand) required before scoring means anything for that body/desk | Not documented as a required step |
+| Account / cloud | None — no signup, no server, everything stays on the machine | Saves "numerical posture metrics" for progress tracking, and offers a paid AI coaching tier — implying some server-side component beyond the local video pipeline |
+| Source | Open, source-available (PolyForm Noncommercial) | Closed source |
+| Price | Free, self-hosted | Free tier + paid coaching tiers |
+
+The honest summary: both claim to keep video processing local and off any
+server, which is the right default for a webcam-based tool. The real
+difference is calibration and transparency, not cloud vs. local — BatesPosture
+asks for an explicit, short calibration per mode and scores posture with an
+inspectable formula anyone can read in `posture_mode.py`; SitSense doesn't
+document a calibration step or its scoring internals, and its paid coaching
+tier implies some data leaves the browser even though raw video doesn't.
 
 ## Configuration
 

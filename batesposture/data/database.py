@@ -73,10 +73,13 @@ class Database:
         self._active_cursor().executescript("""
             CREATE TABLE IF NOT EXISTS posture_scores (
                 timestamp DATETIME,
-                score FLOAT
+                score FLOAT,
+                mode TEXT DEFAULT 'sit'
             );
             CREATE INDEX IF NOT EXISTS idx_scores_timestamp
                 ON posture_scores (timestamp);
+            CREATE INDEX IF NOT EXISTS idx_scores_mode
+                ON posture_scores (mode);
 
             CREATE TABLE IF NOT EXISTS pose_landmarks (
                 timestamp DATETIME,
@@ -94,11 +97,22 @@ class Database:
                 score REAL NOT NULL
             );
             """)
+        self._ensure_mode_column()
         self._connection().commit()
 
-    def save_pose_data(self, landmarks, score: float) -> bool:
+    def _ensure_mode_column(self) -> None:
+        columns = {
+            row[1]
+            for row in self._active_cursor().execute("PRAGMA table_info(posture_scores)")
+        }
+        if "mode" not in columns:
+            self._active_cursor().execute(
+                "ALTER TABLE posture_scores ADD COLUMN mode TEXT DEFAULT 'sit'"
+            )
+
+    def save_pose_data(self, landmarks, score: float, mode: str = "sit") -> bool:
         timestamp = datetime.now().isoformat()
-        self._pending_scores.append((timestamp, score))
+        self._pending_scores.append((timestamp, score, mode))
 
         for landmark_enum in self._landmark_names:
             lm = landmarks.landmark[landmark_enum]
@@ -117,7 +131,7 @@ class Database:
             with connection:
                 if self._pending_scores:
                     connection.executemany(
-                        "INSERT INTO posture_scores VALUES (?, ?)",
+                        "INSERT INTO posture_scores (timestamp, score, mode) VALUES (?, ?, ?)",
                         self._pending_scores,
                     )
                 if self._pending_landmarks:
@@ -165,7 +179,7 @@ class Database:
         """
         filename = f"posture_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         out_path = os.path.join(os.path.expanduser("~"), filename)
-        query = "SELECT timestamp, score FROM posture_scores"
+        query = "SELECT timestamp, score, mode FROM posture_scores"
         params: tuple = ()
         if since_iso:
             query += " WHERE timestamp >= ?"
@@ -175,7 +189,7 @@ class Database:
             rows = self._active_cursor().execute(query, params).fetchall()
             with open(out_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["timestamp", "score"])
+                writer.writerow(["timestamp", "score", "mode"])
                 writer.writerows(rows)
             logger.info("Exported %d score rows to %s", len(rows), out_path)
             return out_path

@@ -1,0 +1,1052 @@
+diff --git a/CLAUDE_SIT_STAND.md b/CLAUDE_SIT_STAND.md
+new file mode 100644
+index 0000000..d81b3fc
+--- /dev/null
++++ b/CLAUDE_SIT_STAND.md
+@@ -0,0 +1,65 @@
++# Sit / stand patch for BatesPosture
++
++Hand this folder to Claude Code. The patch is already applied on top of
++`wtbates99/batesposture` at commit `fb4f117`.
++
++## What changed
++
++BatesPosture now has two calibrated desk modes (`sit`, `stand`), a tray menu to
++switch them, a prompt when you come back into frame, and a `mode` column on
++logged scores / CSV export.
++
++It does **not** auto-classify sit vs stand from MediaPipe. The webcam can only
++hint. The user confirms.
++
++## Files touched
++
++| File | Role |
++|---|---|
++| `batesposture/services/posture_mode.py` | **new** mode helpers, framing hint, presence edges |
++| `batesposture/services/settings_service.py` | `active_mode`, `prompt_on_return`, `sit_baseline`, `stand_baseline`, schema `1.2.0`, migrate old single baseline → sit |
++| `batesposture/ml/pose_detector.py` | extra framing metrics: `mid_shoulder_y`, `shoulder_width`, `hip_visibility` |
++| `batesposture/data/database.py` | `posture_scores.mode`, CSV header `timestamp,score,mode` |
++| `batesposture/ui/onboarding.py` | `mode="sit"|"stand"` calibration wizard |
++| `batesposture/ui/tray.py` | Desk Mode menu, return prompt, hotkeys, mode-tagged DB writes |
++| `batesposture/tests/test_posture_mode.py` | **new** unit tests |
++
++## UX after the patch
++
++Tray → **Desk Mode**
++
++- Sitting (`Ctrl+Alt+1`)
++- Standing (`Ctrl+Alt+2`)
++- Recalibrate this mode… (`Ctrl+Alt+R`)
++- Prompt when I sit back down (checkbox)
++
++If a mode has never been calibrated, choosing it opens the 6-second wizard for
++that mode. After you walk away for ~2s and come back, the app pauses scoring
++and asks Sitting / Standing / Recalibrate / Keep last mode. Suggestion is only
++shown when framing is clearly closer to one baseline.
++
++## Claude Code tasks if you need to keep going
++
++1. Run tests:
++   `uv sync --locked --all-groups && QT_QPA_PLATFORM=offscreen uv run python -m pytest`
++2. If settings tests fail, they likely construct `UserProfileSettings` with a
++   closed field set — add the new fields or ignore extras.
++3. Do not add a sit/stand neural net. If you want smarter switching, tighten
++   `suggest_mode()` in `posture_mode.py`.
++4. Dashboard still reads legacy `baseline_*` fields. Those are synced from the
++   active mode baseline in settings normalization and `_choose_mode()`.
++5. Keep logging opt-in. Default DB write interval is still 900s; lower
++   `db_write_interval_seconds` if you want a real timeline.
++
++## Apply on a clean clone
++
++If this working tree is not what you have:
++
++```bash
++git clone https://github.com/wtbates99/batesposture.git
++cd batesposture
++git apply /path/to/sit-stand.patch
++```
++
++The unified diff is `sit-stand.patch` in this repo root (generated from
++`git diff`).
+diff --git a/README.md b/README.md
+index da884c6..02dc3ae 100644
+--- a/README.md
++++ b/README.md
+@@ -32,6 +32,7 @@ cloud uploads, or telemetry.
+ | Local history | Optional SQLite logging and CSV export |
+ | Adaptive processing | Frame-size and performance controls for slower hardware |
+ | Auto-pause | Away-from-desk time is excluded when no person is detected |
++| Sit / stand modes | Separate sitting and standing baselines, tray switch, return prompt, CSV `mode` column |
+ 
+ ![BatesPosture onboarding calibration screen using a synthetic preview](docs/assets/onboarding.png)
+ 
+diff --git a/batesposture/data/database.py b/batesposture/data/database.py
+index 333d6d3..34af2e8 100644
+--- a/batesposture/data/database.py
++++ b/batesposture/data/database.py
+@@ -73,10 +73,13 @@ class Database:
+         self._active_cursor().executescript("""
+             CREATE TABLE IF NOT EXISTS posture_scores (
+                 timestamp DATETIME,
+-                score FLOAT
++                score FLOAT,
++                mode TEXT DEFAULT 'sit'
+             );
+             CREATE INDEX IF NOT EXISTS idx_scores_timestamp
+                 ON posture_scores (timestamp);
++            CREATE INDEX IF NOT EXISTS idx_scores_mode
++                ON posture_scores (mode);
+ 
+             CREATE TABLE IF NOT EXISTS pose_landmarks (
+                 timestamp DATETIME,
+@@ -94,11 +97,22 @@ class Database:
+                 score REAL NOT NULL
+             );
+             """)
++        self._ensure_mode_column()
+         self._connection().commit()
+ 
+-    def save_pose_data(self, landmarks, score: float) -> bool:
++    def _ensure_mode_column(self) -> None:
++        columns = {
++            row[1]
++            for row in self._active_cursor().execute("PRAGMA table_info(posture_scores)")
++        }
++        if "mode" not in columns:
++            self._active_cursor().execute(
++                "ALTER TABLE posture_scores ADD COLUMN mode TEXT DEFAULT 'sit'"
++            )
++
++    def save_pose_data(self, landmarks, score: float, mode: str = "sit") -> bool:
+         timestamp = datetime.now().isoformat()
+-        self._pending_scores.append((timestamp, score))
++        self._pending_scores.append((timestamp, score, mode))
+ 
+         for landmark_enum in self._landmark_names:
+             lm = landmarks.landmark[landmark_enum]
+@@ -117,7 +131,7 @@ class Database:
+             with connection:
+                 if self._pending_scores:
+                     connection.executemany(
+-                        "INSERT INTO posture_scores VALUES (?, ?)",
++                        "INSERT INTO posture_scores (timestamp, score, mode) VALUES (?, ?, ?)",
+                         self._pending_scores,
+                     )
+                 if self._pending_landmarks:
+@@ -165,7 +179,7 @@ class Database:
+         """
+         filename = f"posture_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+         out_path = os.path.join(os.path.expanduser("~"), filename)
+-        query = "SELECT timestamp, score FROM posture_scores"
++        query = "SELECT timestamp, score, mode FROM posture_scores"
+         params: tuple = ()
+         if since_iso:
+             query += " WHERE timestamp >= ?"
+@@ -175,7 +189,7 @@ class Database:
+             rows = self._active_cursor().execute(query, params).fetchall()
+             with open(out_path, "w", newline="", encoding="utf-8") as f:
+                 writer = csv.writer(f)
+-                writer.writerow(["timestamp", "score"])
++                writer.writerow(["timestamp", "score", "mode"])
+                 writer.writerows(rows)
+             logger.info("Exported %d score rows to %s", len(rows), out_path)
+             return out_path
+diff --git a/batesposture/ml/pose_detector.py b/batesposture/ml/pose_detector.py
+index 04e3dc2..49ea0c5 100644
+--- a/batesposture/ml/pose_detector.py
++++ b/batesposture/ml/pose_detector.py
+@@ -104,7 +104,10 @@ class PoseDetector:
+                 points = np.array(
+                     [[lm.x, lm.y, lm.z] for lm in results.pose_landmarks.landmark]
+                 )
+-                metrics = self._compute_posture_metrics_from_points(points)
++                visibility = np.array(
++                    [getattr(lm, "visibility", 1.0) for lm in results.pose_landmarks.landmark]
++                )
++                metrics = self._compute_posture_metrics_from_points(points, visibility)
+                 posture_score = metrics["posture_score"]
+                 self._draw_landmarks(frame, results, points)
+                 self._draw_posture_feedback(frame, posture_score)
+@@ -179,10 +182,13 @@ class PoseDetector:
+ 
+     def _compute_posture_metrics(self, landmarks: Any) -> dict[str, float]:
+         points = np.array([[lm.x, lm.y, lm.z] for lm in landmarks.landmark])
+-        return self._compute_posture_metrics_from_points(points)
++        visibility = np.array(
++            [getattr(lm, "visibility", 1.0) for lm in landmarks.landmark]
++        )
++        return self._compute_posture_metrics_from_points(points, visibility)
+ 
+     def _compute_posture_metrics_from_points(
+-        self, points: np.ndarray
++        self, points: np.ndarray, visibility: np.ndarray | None = None
+     ) -> dict[str, float]:
+         nose = points[self.mp_pose.PoseLandmark.NOSE]
+         ears = points[
+@@ -255,6 +261,13 @@ class PoseDetector:
+             ]
+         )
+         posture_score = float(np.clip(np.dot(scores, self.weights) * 100, 0, 100))
++        left_hip = self.mp_pose.PoseLandmark.LEFT_HIP
++        right_hip = self.mp_pose.PoseLandmark.RIGHT_HIP
++        if visibility is not None and visibility.shape[0] > int(right_hip):
++            hip_visibility = float((visibility[int(left_hip)] + visibility[int(right_hip)]) * 0.5)
++        else:
++            hip_visibility = 1.0 if mid_hip[1] > mid_shoulder[1] else 0.0
++
+         return {
+             "posture_score": posture_score,
+             "neck_angle": float(neck_angle),
+@@ -263,6 +276,9 @@ class PoseDetector:
+             "head_tilt_score": float(head_tilt_score),
+             "neck_vertical_score": float(neck_vertical_score),
+             "spine_alignment_score": float(spine_alignment_score),
++            "mid_shoulder_y": float(mid_shoulder[1]),
++            "shoulder_width": float(np.linalg.norm(shoulders[1] - shoulders[0])),
++            "hip_visibility": hip_visibility,
+         }
+ 
+     def _calculate_posture_score(self, landmarks: Any) -> float:
+diff --git a/batesposture/services/posture_mode.py b/batesposture/services/posture_mode.py
+new file mode 100644
+index 0000000..8ad2df5
+--- /dev/null
++++ b/batesposture/services/posture_mode.py
+@@ -0,0 +1,179 @@
++"""Sit/stand session mode, framing hints, and presence edges.
++
++This module does not classify sit vs stand from MediaPipe. It stores two
++calibrated baselines, compares camera-space framing only as a suggestion,
++and lets the tray prompt or hotkey choose the active mode.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from enum import Enum
++from time import monotonic
++from typing import Any, Mapping
++
++
++class DeskMode(str, Enum):
++    SIT = "sit"
++    STAND = "stand"
++
++
++VALID_MODES = {DeskMode.SIT.value, DeskMode.STAND.value}
++
++
++def default_baseline_dict() -> dict[str, Any]:
++    return {
++        "posture_score": 75.0,
++        "neck_angle": 10.0,
++        "shoulder_delta": 0.05,
++        "spine_angle": 10.0,
++        "mid_shoulder_y": 0.45,
++        "shoulder_width": 0.25,
++        "hip_visibility": 0.0,
++        "sample_count": 0,
++        "calibrated": False,
++    }
++
++
++def coerce_baseline(raw: Any) -> dict[str, Any]:
++    baseline = default_baseline_dict()
++    if isinstance(raw, Mapping):
++        for key, value in raw.items():
++            if key not in baseline:
++                continue
++            if key == "calibrated":
++                if isinstance(value, str):
++                    baseline[key] = value.strip().lower() in {"1", "true", "yes", "on"}
++                else:
++                    baseline[key] = bool(value)
++            elif key == "sample_count":
++                try:
++                    baseline[key] = int(value)
++                except (TypeError, ValueError):
++                    pass
++            else:
++                try:
++                    baseline[key] = float(value)
++                except (TypeError, ValueError):
++                    pass
++    return baseline
++
++
++def baseline_is_calibrated(raw: Any) -> bool:
++    return bool(coerce_baseline(raw).get("calibrated"))
++
++
++@dataclass(frozen=True)
++class FramingSnapshot:
++    mid_shoulder_y: float
++    shoulder_width: float
++    hip_visibility: float
++    neck_angle: float = 0.0
++    spine_angle: float = 0.0
++
++    @classmethod
++    def from_metrics(cls, metrics: Mapping[str, Any] | None) -> FramingSnapshot | None:
++        if not metrics:
++            return None
++        try:
++            return cls(
++                mid_shoulder_y=float(metrics.get("mid_shoulder_y", 0.45)),
++                shoulder_width=float(metrics.get("shoulder_width", 0.25)),
++                hip_visibility=float(metrics.get("hip_visibility", 0.0)),
++                neck_angle=float(metrics.get("neck_angle", 0.0)),
++                spine_angle=float(metrics.get("spine_angle", 0.0)),
++            )
++        except (TypeError, ValueError):
++            return None
++
++
++def framing_distance(snap: FramingSnapshot, baseline: Mapping[str, Any]) -> float:
++    parsed = coerce_baseline(baseline)
++    if not parsed["calibrated"]:
++        return float("inf")
++    return (
++        3.0 * abs(snap.mid_shoulder_y - parsed["mid_shoulder_y"])
++        + 1.5 * abs(snap.shoulder_width - parsed["shoulder_width"])
++        + 1.0 * abs(snap.hip_visibility - parsed["hip_visibility"])
++    )
++
++
++def suggest_mode(
++    snap: FramingSnapshot | None,
++    sit_baseline: Mapping[str, Any],
++    stand_baseline: Mapping[str, Any],
++    min_gap: float = 0.12,
++) -> DeskMode | None:
++    """Return a mode only when one calibrated baseline is clearly closer."""
++    if snap is None:
++        return None
++    distances = {
++        DeskMode.SIT: framing_distance(snap, sit_baseline),
++        DeskMode.STAND: framing_distance(snap, stand_baseline),
++    }
++    ranked = sorted(distances.items(), key=lambda item: item[1])
++    best_mode, best = ranked[0]
++    _, second = ranked[1]
++    if best == float("inf"):
++        return None
++    if best + min_gap < second:
++        return best_mode
++    return None
++
++
++def score_against_baseline(metrics: Mapping[str, Any], baseline: Mapping[str, Any]) -> float:
++    """Penalty score relative to a calibrated good pose. 100 = matches baseline."""
++    parsed = coerce_baseline(baseline)
++    if not parsed["calibrated"]:
++        try:
++            return float(metrics.get("posture_score", 0.0))
++        except (TypeError, ValueError):
++            return 0.0
++    try:
++        neck = abs(float(metrics.get("neck_angle", 0.0)) - parsed["neck_angle"]) / 25.0
++        spine = abs(float(metrics.get("spine_angle", 0.0)) - parsed["spine_angle"]) / 25.0
++        shoulder = (
++            abs(float(metrics.get("shoulder_vertical_delta", 0.0)) - parsed["shoulder_delta"])
++            / 0.08
++        )
++    except (TypeError, ValueError):
++        return float(metrics.get("posture_score", 0.0) or 0.0)
++    penalty = 0.45 * neck + 0.35 * spine + 0.20 * shoulder
++    return float(max(0.0, min(100.0, 100.0 * (1.0 - penalty))))
++
++
++@dataclass
++class PresenceState:
++    """Debounced person-in-frame detector. Emits arrived/left once per edge."""
++
++    absent_confirm_s: float = 2.0
++    present_confirm_s: float = 0.8
++    _seen: bool = False
++    _edge_t: float = field(default_factory=monotonic)
++    _confirmed_present: bool = False
++
++    def update(self, person_in_frame: bool) -> str:
++        now = monotonic()
++        if person_in_frame != self._seen:
++            self._seen = person_in_frame
++            self._edge_t = now
++            return "pending"
++
++        held = now - self._edge_t
++        if person_in_frame and not self._confirmed_present and held >= self.present_confirm_s:
++            self._confirmed_present = True
++            return "arrived"
++        if not person_in_frame and self._confirmed_present and held >= self.absent_confirm_s:
++            self._confirmed_present = False
++            return "left"
++        return "stable"
++
++    def reset(self) -> None:
++        self._seen = False
++        self._confirmed_present = False
++        self._edge_t = monotonic()
++
++
++def normalize_mode(value: Any, fallback: str = DeskMode.SIT.value) -> str:
++    text = str(value or fallback).strip().lower()
++    return text if text in VALID_MODES else fallback
+diff --git a/batesposture/services/settings_service.py b/batesposture/services/settings_service.py
+index 323a8c3..5fa4126 100644
+--- a/batesposture/services/settings_service.py
++++ b/batesposture/services/settings_service.py
+@@ -18,10 +18,11 @@ from collections.abc import Iterable, Iterator, Mapping, MutableMapping
+ # Import MediaPipe before PyQt6 on Windows to avoid DLL initialization failures
+ # when settings are imported outside the main application entry point.
+ from ..ml.mediapipe_compat import MP_SOLUTIONS
++from .posture_mode import coerce_baseline, default_baseline_dict, normalize_mode
+ 
+ from PyQt6.QtCore import QSettings, QStandardPaths
+ 
+-SETTINGS_SCHEMA_VERSION = "1.1.0"
++SETTINGS_SCHEMA_VERSION = "1.2.0"
+ SETTINGS_ORGANIZATION = "BatesPosture"
+ SETTINGS_APPLICATION = "PostureApp"
+ ENV_PREFIX = "POSTURE"
+@@ -181,6 +182,10 @@ class UserProfileSettings:
+     baseline_neck_angle: float = 10.0
+     baseline_shoulder_level: float = 0.05
+     preferred_theme: str = "system"
++    active_mode: str = "sit"
++    prompt_on_return: bool = True
++    sit_baseline: dict[str, Any] = field(default_factory=default_baseline_dict)
++    stand_baseline: dict[str, Any] = field(default_factory=default_baseline_dict)
+ 
+ 
+ POSTURE_LANDMARKS = [
+@@ -403,14 +408,74 @@ class SettingsStore:
+             self.ml.posture_weights = weights
+             ml_changed = True
+ 
++        profile_changed = False
+         if self.profile.preferred_theme not in {"system", "light", "dark"}:
+             self.profile.preferred_theme = "system"
+-            self.save_profile()
++            profile_changed = True
++
++        normalized_mode = normalize_mode(self.profile.active_mode)
++        if normalized_mode != self.profile.active_mode:
++            self.profile.active_mode = normalized_mode
++            profile_changed = True
++
++        sit_baseline = coerce_baseline(self.profile.sit_baseline)
++        stand_baseline = coerce_baseline(self.profile.stand_baseline)
++        if sit_baseline != self.profile.sit_baseline:
++            self.profile.sit_baseline = sit_baseline
++            profile_changed = True
++        if stand_baseline != self.profile.stand_baseline:
++            self.profile.stand_baseline = stand_baseline
++            profile_changed = True
++
++        if self._migrate_legacy_sit_baseline():
++            profile_changed = True
++        if self._sync_legacy_baseline_fields():
++            profile_changed = True
+ 
+         if runtime_changed:
+             self.save_runtime()
+         if ml_changed:
+             self.save_ml()
++        if profile_changed:
++            self.save_profile()
++
++    def _migrate_legacy_sit_baseline(self) -> bool:
++        """Copy the original single baseline into sit_baseline when needed."""
++        sit = coerce_baseline(self.profile.sit_baseline)
++        if sit.get("calibrated"):
++            return False
++        if not self.profile.has_completed_onboarding:
++            return False
++        sit.update(
++            {
++                "posture_score": float(self.profile.baseline_posture_score),
++                "neck_angle": float(self.profile.baseline_neck_angle),
++                "shoulder_delta": float(self.profile.baseline_shoulder_level),
++                "calibrated": True,
++            }
++        )
++        self.profile.sit_baseline = sit
++        return True
++
++    def _sync_legacy_baseline_fields(self) -> bool:
++        """Keep dashboard fields aligned with the active mode baseline."""
++        mode = normalize_mode(self.profile.active_mode)
++        baseline = coerce_baseline(
++            self.profile.stand_baseline if mode == "stand" else self.profile.sit_baseline
++        )
++        if not baseline.get("calibrated"):
++            return False
++        changed = False
++        mapping = {
++            "baseline_posture_score": float(baseline["posture_score"]),
++            "baseline_neck_angle": float(baseline["neck_angle"]),
++            "baseline_shoulder_level": float(baseline["shoulder_delta"]),
++        }
++        for field_name, value in mapping.items():
++            if getattr(self.profile, field_name) != value:
++                setattr(self.profile, field_name, value)
++                changed = True
++        return changed
+ 
+     @staticmethod
+     def _coerce_tracking_intervals(raw: Any) -> dict[str, int]:
+@@ -612,6 +677,10 @@ LEGACY_KEY_TO_SECTION_FIELD: dict[str, tuple[str, str]] = {
+     "BASELINE_NECK_ANGLE": ("profile", "baseline_neck_angle"),
+     "BASELINE_SHOULDER_LEVEL": ("profile", "baseline_shoulder_level"),
+     "PREFERRED_THEME": ("profile", "preferred_theme"),
++    "ACTIVE_MODE": ("profile", "active_mode"),
++    "PROMPT_ON_RETURN": ("profile", "prompt_on_return"),
++    "SIT_BASELINE": ("profile", "sit_baseline"),
++    "STAND_BASELINE": ("profile", "stand_baseline"),
+ }
+ 
+ 
+diff --git a/batesposture/tests/test_posture_mode.py b/batesposture/tests/test_posture_mode.py
+new file mode 100644
+index 0000000..ac32cbd
+--- /dev/null
++++ b/batesposture/tests/test_posture_mode.py
+@@ -0,0 +1,69 @@
++from ..services.posture_mode import (
++    DeskMode,
++    FramingSnapshot,
++    PresenceState,
++    coerce_baseline,
++    framing_distance,
++    normalize_mode,
++    score_against_baseline,
++    suggest_mode,
++)
++
++
++def test_normalize_mode_rejects_junk() -> None:
++    assert normalize_mode("STAND") == "stand"
++    assert normalize_mode("nope") == "sit"
++
++
++def test_suggest_mode_requires_clear_gap() -> None:
++    sit = coerce_baseline(
++        {
++            "mid_shoulder_y": 0.55,
++            "shoulder_width": 0.22,
++            "hip_visibility": 0.2,
++            "calibrated": True,
++        }
++    )
++    stand = coerce_baseline(
++        {
++            "mid_shoulder_y": 0.32,
++            "shoulder_width": 0.24,
++            "hip_visibility": 0.8,
++            "calibrated": True,
++        }
++    )
++    snap = FramingSnapshot(mid_shoulder_y=0.33, shoulder_width=0.24, hip_visibility=0.75)
++    assert suggest_mode(snap, sit, stand) is DeskMode.STAND
++    ambiguous = FramingSnapshot(mid_shoulder_y=0.44, shoulder_width=0.23, hip_visibility=0.5)
++    assert suggest_mode(ambiguous, sit, stand) is None
++
++
++def test_framing_distance_infinite_when_uncalibrated() -> None:
++    snap = FramingSnapshot(0.4, 0.2, 0.5)
++    assert framing_distance(snap, {"calibrated": False}) == float("inf")
++
++
++def test_score_against_baseline_is_100_when_identical() -> None:
++    baseline = coerce_baseline(
++        {
++            "neck_angle": 12.0,
++            "spine_angle": 8.0,
++            "shoulder_delta": 0.02,
++            "calibrated": True,
++        }
++    )
++    metrics = {
++        "neck_angle": 12.0,
++        "spine_angle": 8.0,
++        "shoulder_vertical_delta": 0.02,
++        "posture_score": 40.0,
++    }
++    assert score_against_baseline(metrics, baseline) == 100.0
++
++
++def test_presence_emits_left_and_arrived(monkeypatch) -> None:
++    state = PresenceState(absent_confirm_s=0.0, present_confirm_s=0.0)
++    # Force confirmed present first.
++    assert state.update(True) == "arrived"
++    assert state.update(False) == "left"
++    assert state.update(True) == "arrived"
+diff --git a/batesposture/ui/onboarding.py b/batesposture/ui/onboarding.py
+index f1d79b5..b2d63f3 100644
+--- a/batesposture/ui/onboarding.py
++++ b/batesposture/ui/onboarding.py
+@@ -36,6 +36,10 @@ class CalibrationResult:
+     neck_angle: float
+     shoulder_delta: float
+     sample_count: int = 0
++    spine_angle: float = 10.0
++    mid_shoulder_y: float = 0.45
++    shoulder_width: float = 0.25
++    hip_visibility: float = 0.0
+ 
+ 
+ class CameraPreviewWidget(QLabel):
+@@ -152,6 +156,10 @@ class CalibrationWorker(QObject):
+                 "posture_score": [],
+                 "neck_angle": [],
+                 "shoulder_delta": [],
++                "spine_angle": [],
++                "mid_shoulder_y": [],
++                "shoulder_width": [],
++                "hip_visibility": [],
+             }
+ 
+             while not self._stop and time.monotonic() - start_time < self._duration:
+@@ -179,6 +187,10 @@ class CalibrationWorker(QObject):
+                 collected["shoulder_delta"].append(
+                     metrics.get("shoulder_vertical_delta", 0.0)
+                 )
++                collected["spine_angle"].append(metrics.get("spine_angle", 10.0))
++                collected["mid_shoulder_y"].append(metrics.get("mid_shoulder_y", 0.45))
++                collected["shoulder_width"].append(metrics.get("shoulder_width", 0.25))
++                collected["hip_visibility"].append(metrics.get("hip_visibility", 0.0))
+                 self.progress_changed.emit(
+                     min(99, int(elapsed / self._duration * 100)),
+                     remaining,
+@@ -216,6 +228,10 @@ class CalibrationWorker(QObject):
+                 sum(collected["shoulder_delta"]) / len(collected["shoulder_delta"])
+             ),
+             sample_count=len(collected["posture_score"]),
++            spine_angle=float(sum(collected["spine_angle"]) / len(collected["spine_angle"])),
++            mid_shoulder_y=float(sum(collected["mid_shoulder_y"]) / len(collected["mid_shoulder_y"])),
++            shoulder_width=float(sum(collected["shoulder_width"]) / len(collected["shoulder_width"])),
++            hip_visibility=float(sum(collected["hip_visibility"]) / len(collected["hip_visibility"])),
+         )
+         self.finished.emit(result)
+ 
+@@ -223,9 +239,15 @@ class CalibrationWorker(QObject):
+ class WelcomePage(QWizardPage):
+     """Opening wizard page — introduces the three-step onboarding flow."""
+ 
+-    def __init__(self, icon_path: str, parent: QWidget | None = None) -> None:
++    def __init__(
++        self,
++        icon_path: str,
++        parent: QWidget | None = None,
++        mode: str = "sit",
++    ) -> None:
+         super().__init__(parent)
+-        self.setTitle(self.tr("Welcome"))
++        self._mode = mode
++        self.setTitle(self.tr("Standing baseline") if mode == "stand" else self.tr("Welcome"))
+         self.setSubTitle(
+             self.tr("A short calibration personalizes your posture score.")
+         )
+@@ -251,6 +273,10 @@ class WelcomePage(QWizardPage):
+ 
+         hero = QLabel(
+             self.tr(
++                "Stand the way you work while BatesPosture learns your neutral alignment. Your camera stays local to this device."
++            )
++            if self._mode == "stand"
++            else self.tr(
+                 "Sit naturally while BatesPosture learns your neutral alignment. Your camera stays local to this device."
+             )
+         )
+@@ -388,6 +414,23 @@ class CalibrationPage(QWizardPage):
+         self._worker: CalibrationWorker | None = None
+         self._metrics: CalibrationResult | None = None
+         self._timeout: QTimer | None = None
++        self._mode = "sit"
++
++    def set_mode(self, mode: str) -> None:
++        self._mode = mode
++        if mode == "stand":
++            self.setSubTitle(
++                self.tr("Hold your usual standing-desk stance for a short sample.")
++            )
++            self.status_label.setText(
++                self.tr('When you\'re ready, stand comfortably and press "Start calibration".')
++            )
++        else:
++            self.setSubTitle(
++                self.tr(
++                    "We'll measure a short sample so posture insights match your neutral stance."
++                )
++            )
+ 
+     def initializePage(self) -> None:  # noqa: N802 - Qt override
+         self.preview.start(self._settings.runtime.default_camera_id)
+@@ -541,19 +584,30 @@ class CalibrationPage(QWizardPage):
+ 
+ class OnboardingWizard(QWizard):
+     def __init__(
+-        self, settings_service: SettingsService, parent: QWidget | None = None
++        self,
++        settings_service: SettingsService,
++        parent: QWidget | None = None,
++        mode: str = "sit",
+     ) -> None:
+         super().__init__(parent)
+         self._settings = settings_service
+-        self.setWindowTitle(self.tr("BatesPosture Setup"))
++        self._mode = mode if mode in {"sit", "stand"} else "sit"
++        self.setWindowTitle(
++            self.tr("BatesPosture Standing Setup")
++            if self._mode == "stand"
++            else self.tr("BatesPosture Setup")
++        )
+         self.setOption(QWizard.WizardOption.IndependentPages, False)
+         self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
+         self.setMinimumSize(560, 600)
+         self.resize(620, 680)
+ 
+-        self.welcome_page = WelcomePage(settings_service.resources.icon_path)
++        self.welcome_page = WelcomePage(
++            settings_service.resources.icon_path, mode=self._mode
++        )
+         self.camera_page = CameraSetupPage(settings_service)
+         self.calibration_page = CalibrationPage(settings_service)
++        self.calibration_page.set_mode(self._mode)
+ 
+         self._welcome_page_id = self.addPage(self.welcome_page)
+         self._camera_page_id = self.addPage(self.camera_page)
+@@ -571,12 +625,33 @@ class OnboardingWizard(QWizard):
+     def accept(self) -> None:
+         metrics = self.calibration_page.metrics()
+         if metrics:
+-            self._settings.update_profile(
+-                has_completed_onboarding=True,
+-                baseline_posture_score=metrics.posture_score,
+-                baseline_neck_angle=metrics.neck_angle,
+-                baseline_shoulder_level=metrics.shoulder_delta,
++            from ..services.posture_mode import coerce_baseline
++
++            baseline = coerce_baseline(
++                {
++                    "posture_score": metrics.posture_score,
++                    "neck_angle": metrics.neck_angle,
++                    "shoulder_delta": metrics.shoulder_delta,
++                    "spine_angle": metrics.spine_angle,
++                    "mid_shoulder_y": metrics.mid_shoulder_y,
++                    "shoulder_width": metrics.shoulder_width,
++                    "hip_visibility": metrics.hip_visibility,
++                    "sample_count": metrics.sample_count,
++                    "calibrated": True,
++                }
+             )
++            updates = {
++                "has_completed_onboarding": True,
++                "active_mode": self._mode,
++                "baseline_posture_score": metrics.posture_score,
++                "baseline_neck_angle": metrics.neck_angle,
++                "baseline_shoulder_level": metrics.shoulder_delta,
++            }
++            if self._mode == "stand":
++                updates["stand_baseline"] = baseline
++            else:
++                updates["sit_baseline"] = baseline
++            self._settings.update_profile(**updates)
+         self._stop_camera_activity()
+         super().accept()
+ 
+@@ -598,8 +673,9 @@ def run_onboarding_if_needed(
+     settings_service: SettingsService,
+     parent: QWidget | None = None,
+     force: bool = False,
++    mode: str = "sit",
+ ) -> bool:
+     if settings_service.profile.has_completed_onboarding and not force:
+         return False
+-    wizard = OnboardingWizard(settings_service, parent)
++    wizard = OnboardingWizard(settings_service, parent, mode=mode)
+     return wizard.exec() == QDialog.DialogCode.Accepted
+diff --git a/batesposture/ui/tray.py b/batesposture/ui/tray.py
+index 529bf9b..30996a3 100644
+--- a/batesposture/ui/tray.py
++++ b/batesposture/ui/tray.py
+@@ -20,6 +20,15 @@ from ..services.camera_capture import discover_camera_ids
+ from ..services.camera_service import CameraService
+ from ..services.notification_service import NotificationService
+ from ..services.score_service import ScoreService
++from ..services.posture_mode import (
++    DeskMode,
++    FramingSnapshot,
++    baseline_is_calibrated,
++    coerce_baseline,
++    normalize_mode,
++    score_against_baseline,
++    suggest_mode,
++)
+ from ..services.settings_service import (
+     BREAK_REMINDER_MINUTES,
+     SettingsService,
+@@ -84,6 +93,8 @@ class PostureTrackerTray(QSystemTrayIcon):
+         self._onboarding_completed_this_run = False
+         self._onboarding_cancelled = False
+         self._open_dashboard_on_first_tracking = False
++        self._mode_prompt_open = False
++        self._pending_return_prompt = False
+ 
+         self._initialize_application()
+         self._run_onboarding_if_needed()
+@@ -151,6 +162,9 @@ class PostureTrackerTray(QSystemTrayIcon):
+         menu.addAction(self.toggle_tracking_action)
+         menu.addAction(self.toggle_dashboard_action)
+ 
++        self.mode_menu = self._create_mode_menu(menu)
++        self.mode_menu_action = menu.addMenu(self.mode_menu)
++
+         self.interval_menu = self._create_interval_menu(menu)
+         self.interval_menu.setIcon(
+             style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
+@@ -159,6 +173,9 @@ class PostureTrackerTray(QSystemTrayIcon):
+         if self._onboarding_cancelled:
+             self.toggle_tracking_action.setEnabled(False)
+             self.interval_menu_action.setEnabled(False)
++            if hasattr(self, "mode_menu_action"):
++                self.mode_menu_action.setEnabled(False)
++            self.mode_menu_action.setEnabled(False)
+ 
+         runtime = self._settings.runtime
+         menu.addSection("Quick toggles")
+@@ -248,6 +265,43 @@ class PostureTrackerTray(QSystemTrayIcon):
+                 action.setChecked(True)
+         return interval_menu
+ 
++    def _create_mode_menu(self, parent_menu: QMenu) -> QMenu:
++        mode_menu = QMenu("Desk Mode", parent_menu)
++        group = QActionGroup(mode_menu)
++        group.setExclusive(True)
++        active = normalize_mode(self._settings.profile.active_mode)
++
++        self.sit_mode_action = QAction("Sitting", mode_menu, checkable=True)
++        self.sit_mode_action.setShortcut("Ctrl+Alt+1")
++        self.sit_mode_action.setData(DeskMode.SIT.value)
++        self.sit_mode_action.triggered.connect(lambda: self._choose_mode(DeskMode.SIT.value))
++        group.addAction(self.sit_mode_action)
++        mode_menu.addAction(self.sit_mode_action)
++
++        self.stand_mode_action = QAction("Standing", mode_menu, checkable=True)
++        self.stand_mode_action.setShortcut("Ctrl+Alt+2")
++        self.stand_mode_action.setData(DeskMode.STAND.value)
++        self.stand_mode_action.triggered.connect(lambda: self._choose_mode(DeskMode.STAND.value))
++        group.addAction(self.stand_mode_action)
++        mode_menu.addAction(self.stand_mode_action)
++
++        self.sit_mode_action.setChecked(active == DeskMode.SIT.value)
++        self.stand_mode_action.setChecked(active == DeskMode.STAND.value)
++
++        mode_menu.addSeparator()
++        self.recalibrate_mode_action = QAction("Recalibrate this mode…", mode_menu)
++        self.recalibrate_mode_action.setShortcut("Ctrl+Alt+R")
++        self.recalibrate_mode_action.triggered.connect(self._recalibrate_active_mode)
++        mode_menu.addAction(self.recalibrate_mode_action)
++
++        self.prompt_on_return_action = QAction(
++            "Prompt when I sit back down", mode_menu, checkable=True
++        )
++        self.prompt_on_return_action.setChecked(self._settings.profile.prompt_on_return)
++        self.prompt_on_return_action.triggered.connect(self._toggle_prompt_on_return)
++        mode_menu.addAction(self.prompt_on_return_action)
++        return mode_menu
++
+     def _setup_signal_handling(self) -> None:
+         import signal
+ 
+@@ -386,18 +440,21 @@ class PostureTrackerTray(QSystemTrayIcon):
+ 
+         self._absence_started_at = None
+         if self._tracking_paused_for_absence:
+-            self._resume_tracking_after_presence()
++            self._resume_tracking_after_presence(results_bundle.metrics)
+         if isinstance(self.video_window, PostureDashboard):
+             self.video_window.set_tracking_state("tracking")
+ 
+-        self._scores.add_score(score)
++        metrics: dict | None = results_bundle.metrics
++        logged_score = score
++        baseline = self._active_baseline()
++        if metrics and baseline_is_calibrated(baseline):
++            logged_score = score_against_baseline(metrics, baseline)
++        self._scores.add_score(logged_score)
+         average_score, stats = self._scores.average_and_stats()
+         if abs(average_score - self._last_icon_score) >= 1.0:
+             self.setIcon(create_score_icon(average_score))
+             self._last_icon_score = average_score
+ 
+-        metrics: dict[str, float] | None = results_bundle.metrics
+-
+         if self._database and self._settings.runtime.enable_database_logging:
+             self._save_to_db(average_score, results_bundle)
+ 
+@@ -439,13 +496,17 @@ class PostureTrackerTray(QSystemTrayIcon):
+         self._last_icon_score = -1.0
+         logger.info("Human no longer detected; paused tracking")
+ 
+-    def _resume_tracking_after_presence(self) -> None:
++    def _resume_tracking_after_presence(self, metrics: dict | None = None) -> None:
+         self._tracking_paused_for_absence = False
+-        self._scores.resume_session()
+         self._continuous_tracking_start = datetime.now()
+         self._break_reminder_sent = False
+         self.last_db_save = None
+         logger.info("Human detected again; resumed tracking")
++        if self._settings.profile.prompt_on_return:
++            self._pending_return_prompt = True
++            self._prompt_mode_on_return(metrics)
++        else:
++            self._scores.resume_session()
+ 
+     def _update_tooltip(self, average_score: float) -> None:
+         grade = score_grade(average_score)
+@@ -547,7 +608,11 @@ class PostureTrackerTray(QSystemTrayIcon):
+             return
+         pose_results = results_bundle.pose_landmarks
+         if pose_results:
+-            saved = self._database.save_pose_data(pose_results, average_score)
++            saved = self._database.save_pose_data(
++                pose_results,
++                average_score,
++                mode=normalize_mode(self._settings.profile.active_mode),
++            )
+             if saved is not False:
+                 self.last_db_save = current_time
+ 
+@@ -606,20 +671,109 @@ class PostureTrackerTray(QSystemTrayIcon):
+         if dialog.exec() == QDialog.DialogCode.Accepted:  # type: ignore
+             self._refresh_after_settings_change()
+             if dialog.recalibration_requested:
+-                self._run_recalibration()
++                self._run_recalibration(mode=self._settings.profile.active_mode)
++
++    def _recalibrate_active_mode(self) -> None:
++        self._run_recalibration(mode=normalize_mode(self._settings.profile.active_mode))
++
++    def _toggle_prompt_on_return(self, checked: bool) -> None:
++        self._settings.update_profile(prompt_on_return=checked)
++
++    def _active_baseline(self) -> dict:
++        profile = self._settings.profile
++        mode = normalize_mode(profile.active_mode)
++        raw = profile.stand_baseline if mode == DeskMode.STAND.value else profile.sit_baseline
++        return coerce_baseline(raw)
++
++    def _sync_mode_actions(self) -> None:
++        mode = normalize_mode(self._settings.profile.active_mode)
++        if hasattr(self, "sit_mode_action"):
++            self.sit_mode_action.setChecked(mode == DeskMode.SIT.value)
++            self.stand_mode_action.setChecked(mode == DeskMode.STAND.value)
++
++    def _choose_mode(self, mode: str, skip_prompt_reset: bool = False) -> None:
++        mode = normalize_mode(mode)
++        profile = self._settings.profile
++        baseline = (
++            coerce_baseline(profile.stand_baseline)
++            if mode == DeskMode.STAND.value
++            else coerce_baseline(profile.sit_baseline)
++        )
++        if not baseline_is_calibrated(baseline):
++            self._run_recalibration(mode=mode)
++            return
++        message = (
++            "Stand tall."
++            if mode == DeskMode.STAND.value
++            else "Please sit up straight!"
++        )
++        self._settings.update_profile(
++            active_mode=mode,
++            baseline_posture_score=float(baseline["posture_score"]),
++            baseline_neck_angle=float(baseline["neck_angle"]),
++            baseline_shoulder_level=float(baseline["shoulder_delta"]),
++        )
++        self._settings.update_runtime(default_posture_message=message)
++        self._pending_return_prompt = False
++        self._sync_mode_actions()
++        if self.tracking_enabled:
++            self._scores.resume_session()
+ 
+-    def _run_recalibration(self) -> None:
++    def _prompt_mode_on_return(self, metrics: dict | None) -> None:
++        if self._mode_prompt_open:
++            return
++        suggested = suggest_mode(
++            FramingSnapshot.from_metrics(metrics),
++            self._settings.profile.sit_baseline,
++            self._settings.profile.stand_baseline,
++        )
++        if not self._settings.profile.prompt_on_return:
++            self._choose_mode(self._settings.profile.active_mode)
++            return
++        guess = {DeskMode.SIT: "Sitting", DeskMode.STAND: "Standing"}.get(
++            suggested, "your last mode"
++        )
++        self._mode_prompt_open = True
++        try:
++            box = QMessageBox()
++            box.setWindowTitle("BatesPosture")
++            box.setText(f"You're back. Start which session?\nSuggested: {guess}")
++            sit_btn = box.addButton("Sitting", QMessageBox.ButtonRole.AcceptRole)
++            stand_btn = box.addButton("Standing", QMessageBox.ButtonRole.AcceptRole)
++            rec_btn = box.addButton("Recalibrate…", QMessageBox.ButtonRole.ActionRole)
++            box.addButton("Keep last mode", QMessageBox.ButtonRole.RejectRole)
++            box.exec()
++            clicked = box.clickedButton()
++            if clicked is sit_btn:
++                self._choose_mode(DeskMode.SIT.value)
++            elif clicked is stand_btn:
++                self._choose_mode(DeskMode.STAND.value)
++            elif clicked is rec_btn:
++                self._recalibrate_active_mode()
++            else:
++                self._choose_mode(self._settings.profile.active_mode)
++        finally:
++            self._mode_prompt_open = False
++
++    def _run_recalibration(self, mode: str | None = None) -> None:
+         was_tracking = self.tracking_enabled
+         dashboard_was_open = self.video_window is not None
+         if was_tracking:
+             self._stop_tracking()
+-        accepted = run_onboarding_if_needed(self._settings, force=True)
++        accepted = run_onboarding_if_needed(
++            self._settings,
++            force=True,
++            mode=normalize_mode(mode or self._settings.profile.active_mode),
++        )
+         if accepted:
+             self._onboarding_cancelled = False
+             self._auto_schedule_enabled = True
+             self._open_dashboard_on_first_tracking = True
+             self.toggle_tracking_action.setEnabled(True)
+             self.interval_menu_action.setEnabled(True)
++            if hasattr(self, "mode_menu_action"):
++                self.mode_menu_action.setEnabled(True)
++            self._sync_mode_actions()
+             self.showMessage(
+                 "Calibration updated",
+                 "Your new baseline is ready. Tracking is starting now.",
+@@ -635,6 +789,8 @@ class PostureTrackerTray(QSystemTrayIcon):
+             self._auto_schedule_enabled = False
+             self.toggle_tracking_action.setEnabled(False)
+             self.interval_menu_action.setEnabled(False)
++            if hasattr(self, "mode_menu_action"):
++                self.mode_menu_action.setEnabled(False)
+ 
+     def _refresh_after_settings_change(self) -> None:
+         runtime = self._settings.runtime
+@@ -656,6 +812,7 @@ class PostureTrackerTray(QSystemTrayIcon):
+             )
+             if self._onboarding_cancelled:
+                 self.interval_menu_action.setEnabled(False)
++            self._sync_mode_actions()
+ 
+         with self._camera_service.pause_processing():
+             self._camera_service.reload_settings()

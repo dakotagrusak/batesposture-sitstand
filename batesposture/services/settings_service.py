@@ -18,10 +18,11 @@ from collections.abc import Iterable, Iterator, Mapping, MutableMapping
 # Import MediaPipe before PyQt6 on Windows to avoid DLL initialization failures
 # when settings are imported outside the main application entry point.
 from ..ml.mediapipe_compat import MP_SOLUTIONS
+from .posture_mode import coerce_baseline, default_baseline_dict, normalize_mode
 
 from PyQt6.QtCore import QSettings, QStandardPaths
 
-SETTINGS_SCHEMA_VERSION = "1.1.0"
+SETTINGS_SCHEMA_VERSION = "1.2.0"
 SETTINGS_ORGANIZATION = "BatesPosture"
 SETTINGS_APPLICATION = "PostureApp"
 ENV_PREFIX = "POSTURE"
@@ -181,6 +182,10 @@ class UserProfileSettings:
     baseline_neck_angle: float = 10.0
     baseline_shoulder_level: float = 0.05
     preferred_theme: str = "system"
+    active_mode: str = "sit"
+    prompt_on_return: bool = True
+    sit_baseline: dict[str, Any] = field(default_factory=default_baseline_dict)
+    stand_baseline: dict[str, Any] = field(default_factory=default_baseline_dict)
 
 
 POSTURE_LANDMARKS = [
@@ -403,14 +408,74 @@ class SettingsStore:
             self.ml.posture_weights = weights
             ml_changed = True
 
+        profile_changed = False
         if self.profile.preferred_theme not in {"system", "light", "dark"}:
             self.profile.preferred_theme = "system"
-            self.save_profile()
+            profile_changed = True
+
+        normalized_mode = normalize_mode(self.profile.active_mode)
+        if normalized_mode != self.profile.active_mode:
+            self.profile.active_mode = normalized_mode
+            profile_changed = True
+
+        sit_baseline = coerce_baseline(self.profile.sit_baseline)
+        stand_baseline = coerce_baseline(self.profile.stand_baseline)
+        if sit_baseline != self.profile.sit_baseline:
+            self.profile.sit_baseline = sit_baseline
+            profile_changed = True
+        if stand_baseline != self.profile.stand_baseline:
+            self.profile.stand_baseline = stand_baseline
+            profile_changed = True
+
+        if self._migrate_legacy_sit_baseline():
+            profile_changed = True
+        if self._sync_legacy_baseline_fields():
+            profile_changed = True
 
         if runtime_changed:
             self.save_runtime()
         if ml_changed:
             self.save_ml()
+        if profile_changed:
+            self.save_profile()
+
+    def _migrate_legacy_sit_baseline(self) -> bool:
+        """Copy the original single baseline into sit_baseline when needed."""
+        sit = coerce_baseline(self.profile.sit_baseline)
+        if sit.get("calibrated"):
+            return False
+        if not self.profile.has_completed_onboarding:
+            return False
+        sit.update(
+            {
+                "posture_score": float(self.profile.baseline_posture_score),
+                "neck_angle": float(self.profile.baseline_neck_angle),
+                "shoulder_delta": float(self.profile.baseline_shoulder_level),
+                "calibrated": True,
+            }
+        )
+        self.profile.sit_baseline = sit
+        return True
+
+    def _sync_legacy_baseline_fields(self) -> bool:
+        """Keep dashboard fields aligned with the active mode baseline."""
+        mode = normalize_mode(self.profile.active_mode)
+        baseline = coerce_baseline(
+            self.profile.stand_baseline if mode == "stand" else self.profile.sit_baseline
+        )
+        if not baseline.get("calibrated"):
+            return False
+        changed = False
+        mapping = {
+            "baseline_posture_score": float(baseline["posture_score"]),
+            "baseline_neck_angle": float(baseline["neck_angle"]),
+            "baseline_shoulder_level": float(baseline["shoulder_delta"]),
+        }
+        for field_name, value in mapping.items():
+            if getattr(self.profile, field_name) != value:
+                setattr(self.profile, field_name, value)
+                changed = True
+        return changed
 
     @staticmethod
     def _coerce_tracking_intervals(raw: Any) -> dict[str, int]:
@@ -612,6 +677,10 @@ LEGACY_KEY_TO_SECTION_FIELD: dict[str, tuple[str, str]] = {
     "BASELINE_NECK_ANGLE": ("profile", "baseline_neck_angle"),
     "BASELINE_SHOULDER_LEVEL": ("profile", "baseline_shoulder_level"),
     "PREFERRED_THEME": ("profile", "preferred_theme"),
+    "ACTIVE_MODE": ("profile", "active_mode"),
+    "PROMPT_ON_RETURN": ("profile", "prompt_on_return"),
+    "SIT_BASELINE": ("profile", "sit_baseline"),
+    "STAND_BASELINE": ("profile", "stand_baseline"),
 }
 
 
