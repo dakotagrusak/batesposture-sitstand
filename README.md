@@ -44,6 +44,11 @@ This fork adds:
 It intentionally does **not** add a sit/stand classifier — the webcam framing
 can only hint which mode you're in, and the user confirms.
 
+This repository is a real GitHub fork of `wtbates99/batesposture` (not a
+copy), named `batesposture-sitstand` since `batesposture` was already taken
+under this account. That keeps the fork relationship intact so changes here
+can be proposed back upstream via pull request later.
+
 ## What it provides
 
 | Capability | Behavior |
@@ -65,8 +70,8 @@ can only hint which mode you're in, and the user confirms.
 Requires Python 3.10 or newer, [uv](https://docs.astral.sh/uv/), and a webcam.
 
 ```bash
-git clone https://github.com/dakotagrusak/batesposture.git
-cd batesposture
+git clone https://github.com/dakotagrusak/batesposture-sitstand.git
+cd batesposture-sitstand
 uv sync --locked --all-groups
 uv run batesposture
 ```
