@@ -8,9 +8,11 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+import matplotlib.dates as mdates
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -22,7 +24,9 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 from ..data.database import Database, DatabaseInitializationError
@@ -36,7 +40,10 @@ FG = "#e7e2da"
 GRID = "#2a2a2d"
 SIT_COLOR = "#c9b8a8"
 STAND_COLOR = "#8aa4b0"
+UP_COLOR = "#6fae6f"
+DOWN_COLOR = "#c07a72"
 WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+CHART_TYPES = ("Candlestick", "Scatter")
 
 
 class HistoryDialog(QDialog):
@@ -48,6 +55,7 @@ class HistoryDialog(QDialog):
         self.setStyleSheet(f"background: {BG}; color: {FG};")
 
         self._rows: list[hr.HistoryRow] = self._load_from_database()
+        self._visible_rows: list[hr.HistoryRow] = []
 
         layout = QVBoxLayout(self)
 
@@ -73,6 +81,17 @@ class HistoryDialog(QDialog):
         self.empty_label.setWordWrap(True)
         layout.addWidget(self.empty_label)
 
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs, stretch=1)
+        self.tabs.addTab(self._build_overview_tab(), "Overview")
+        self.tabs.addTab(self._build_candles_tab(), "Candles && Scatter")
+
+        self._refresh()
+
+    def _build_overview_tab(self) -> QWidget:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+
         stats_row = QHBoxLayout()
         self.stat_cards: dict[str, QLabel] = {}
         for key, title in (
@@ -89,19 +108,53 @@ class HistoryDialog(QDialog):
             )
             self.stat_cards[key] = card
             stats_row.addWidget(card)
-        layout.addLayout(stats_row)
+        tab_layout.addLayout(stats_row)
 
         self.figure = Figure(figsize=(9, 6.5), facecolor=BG)
         self.canvas = FigureCanvasQTAgg(self.figure)
-        layout.addWidget(self.canvas, stretch=1)
+        tab_layout.addWidget(self.canvas, stretch=1)
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Timestamp", "Score", "Mode", "Note"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setMaximumHeight(220)
-        layout.addWidget(self.table)
+        tab_layout.addWidget(self.table)
+        return tab
 
-        self._refresh()
+    def _build_candles_tab(self) -> QWidget:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Chart:"))
+        self.chart_type_combo = QComboBox()
+        self.chart_type_combo.addItems(list(CHART_TYPES))
+        self.chart_type_combo.currentTextChanged.connect(self._update_candles_view)
+        controls.addWidget(self.chart_type_combo)
+
+        controls.addWidget(QLabel("Candle interval:"))
+        self.interval_combo = QComboBox()
+        self.interval_combo.addItems([label for label, _ in hr.CANDLE_INTERVALS])
+        self.interval_combo.currentTextChanged.connect(self._update_candles_view)
+        controls.addWidget(self.interval_combo)
+        controls.addStretch(1)
+        tab_layout.addLayout(controls)
+
+        note = QLabel(
+            f"Band = rolling mean ± {hr.BOLLINGER_NUM_STD:g} std dev over the "
+            f"trailing {hr.BOLLINGER_WINDOW} candles (Bollinger-style)."
+        )
+        note.setStyleSheet(f"color: {GRID};")
+        tab_layout.addWidget(note)
+
+        self.candle_figure = Figure(figsize=(9, 6.5), facecolor=BG)
+        self.candle_canvas = FigureCanvasQTAgg(self.candle_figure)
+        tab_layout.addWidget(self.candle_canvas, stretch=1)
+        return tab
+
+    def _selected_interval_minutes(self) -> int:
+        label = self.interval_combo.currentText()
+        return dict(hr.CANDLE_INTERVALS)[label]
 
     # -- data loading ---------------------------------------------------
     def _load_from_database(self) -> list[hr.HistoryRow]:
@@ -163,9 +216,11 @@ class HistoryDialog(QDialog):
 
         label = self.lookback_combo.currentText()
         visible = hr.filter_lookback(self._rows, label)
+        self._visible_rows = visible
         self._update_stat_cards(hr.compute_stats(visible))
         self._update_charts(visible, label)
         self._update_table(visible)
+        self._update_candles_view()
 
     def _update_stat_cards(self, stats: dict) -> None:
         def fmt(agg):
@@ -260,6 +315,82 @@ class HistoryDialog(QDialog):
         ax.set_yticks(range(7))
         ax.set_yticklabels(WEEKDAY_LABELS, fontsize=6)
         ax.set_title(title, color=FG, fontsize=8)
+
+    def _update_candles_view(self, *_args) -> None:
+        rows = self._visible_rows
+        interval_minutes = self._selected_interval_minutes()
+        chart_type = self.chart_type_combo.currentText()
+
+        self.candle_figure.clear()
+        self.candle_figure.set_facecolor(BG)
+        if not rows:
+            self.candle_canvas.draw()
+            return
+
+        ohlc = hr.ohlc_by_mode(rows, interval_minutes)
+
+        if chart_type == "Candlestick":
+            axes = self.candle_figure.subplots(2, 1, sharex=False)
+            for ax, mode, band_color in zip(axes, hr.MODES, (SIT_COLOR, STAND_COLOR)):
+                self._style_axes(ax)
+                bars = ohlc[mode]
+                self._draw_candlesticks(ax, bars, interval_minutes)
+                closes = [(bar.t, bar.close) for bar in bars]
+                self._draw_bollinger(ax, hr.bollinger_bands(closes), band_color)
+                ax.xaxis_date()
+                ax.tick_params(axis="x", rotation=20, labelsize=6)
+                ax.set_title(
+                    f"{mode.capitalize()} — {interval_minutes}min candles",
+                    color=FG,
+                    fontsize=9,
+                )
+            self.candle_figure.subplots_adjust(hspace=0.6)
+        else:
+            ax = self.candle_figure.add_subplot(1, 1, 1)
+            self._style_axes(ax)
+            points = hr.timeseries_by_mode(rows, bucket_minutes=None)
+            for mode, color in (("sit", SIT_COLOR), ("stand", STAND_COLOR)):
+                series = points[mode]
+                if series:
+                    xs = [mdates.date2num(t) for t, _ in series]
+                    ys = [s for _, s in series]
+                    ax.scatter(xs, ys, s=10, color=color, alpha=0.6, label=mode.capitalize())
+                closes = [(bar.t, bar.close) for bar in ohlc[mode]]
+                self._draw_bollinger(ax, hr.bollinger_bands(closes), color)
+            ax.xaxis_date()
+            ax.tick_params(axis="x", rotation=20, labelsize=6)
+            ax.legend(facecolor=BG, labelcolor=FG, fontsize=8, framealpha=0)
+            ax.set_title(
+                f"Raw points — band from {interval_minutes}min candles",
+                color=FG,
+                fontsize=9,
+            )
+
+        self.candle_canvas.draw()
+
+    def _draw_candlesticks(
+        self, ax, bars: list[hr.OHLCBar], bucket_minutes: int
+    ) -> None:
+        if not bars:
+            return
+        width = (bucket_minutes / (24 * 60)) * 0.7
+        for bar in bars:
+            x = mdates.date2num(bar.t)
+            color = UP_COLOR if bar.close >= bar.open else DOWN_COLOR
+            ax.vlines(x, bar.low, bar.high, color=color, linewidth=0.8)
+            lower = min(bar.open, bar.close)
+            height = max(abs(bar.close - bar.open), 0.5)
+            ax.add_patch(Rectangle((x - width / 2, lower), width, height, color=color))
+
+    def _draw_bollinger(self, ax, bands: list[hr.BollingerBand], color: str) -> None:
+        if not bands:
+            return
+        xs = [mdates.date2num(b.t) for b in bands]
+        means = [b.mean for b in bands]
+        uppers = [b.upper for b in bands]
+        lowers = [b.lower for b in bands]
+        ax.plot(xs, means, color=color, linewidth=1.0, linestyle="--", alpha=0.9)
+        ax.fill_between(xs, lowers, uppers, color=color, alpha=0.15)
 
     def _update_table(self, rows: list[hr.HistoryRow]) -> None:
         recent = rows[-40:]

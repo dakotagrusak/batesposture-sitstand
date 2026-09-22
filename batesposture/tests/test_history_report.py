@@ -92,6 +92,53 @@ def test_bucket_minutes_scales_with_lookback_span():
     assert hr.bucket_minutes_for(rows, "Last 30 days") == 180
 
 
+def test_ohlc_by_mode_single_point_bucket_has_flat_bar():
+    rows = [_row(datetime(2026, 1, 1, 9, 0), 72.0, "sit")]
+    bars = hr.ohlc_by_mode(rows, bucket_minutes=1)
+    bar = bars["sit"][0]
+    assert (bar.open, bar.high, bar.low, bar.close) == (72.0, 72.0, 72.0, 72.0)
+    assert bar.n == 1
+
+
+def test_ohlc_by_mode_multi_point_bucket_tracks_open_high_low_close():
+    base = datetime(2026, 1, 1, 9, 0)
+    rows = [
+        _row(base, 70.0, "sit"),
+        _row(base.replace(second=20), 90.0, "sit"),
+        _row(base.replace(second=40), 60.0, "sit"),
+        _row(base.replace(second=59), 80.0, "sit"),
+    ]
+    bars = hr.ohlc_by_mode(rows, bucket_minutes=1)
+    bar = bars["sit"][0]
+    assert (bar.open, bar.high, bar.low, bar.close) == (70.0, 90.0, 60.0, 80.0)
+    assert bar.n == 4
+
+
+def test_ohlc_excludes_lost_pose_points():
+    rows = [
+        _row(datetime(2026, 1, 1, 9, 0), 0.0, "sit"),
+        _row(datetime(2026, 1, 1, 9, 0, 30), 80.0, "sit"),
+    ]
+    bars = hr.ohlc_by_mode(rows, bucket_minutes=1)
+    assert len(bars["sit"]) == 1
+    assert bars["sit"][0].n == 1
+
+
+def test_bollinger_bands_widen_with_more_variance():
+    tight = [(datetime(2026, 1, 1, 9, m), 80.0 + (m % 2)) for m in range(10)]
+    wide = [(datetime(2026, 1, 1, 9, m), 80.0 + (m % 2) * 40) for m in range(10)]
+    tight_bands = hr.bollinger_bands(tight, window=10)
+    wide_bands = hr.bollinger_bands(wide, window=10)
+    tight_width = tight_bands[-1].upper - tight_bands[-1].lower
+    wide_width = wide_bands[-1].upper - wide_bands[-1].lower
+    assert wide_width > tight_width
+
+
+def test_bollinger_bands_need_at_least_two_points():
+    single = [(datetime(2026, 1, 1, 9, 0), 80.0)]
+    assert hr.bollinger_bands(single) == []
+
+
 def test_weekday_hour_heatmap_shape_is_7x24():
     rows = [_row(datetime(2026, 1, 5, 9, 0), 50.0, "sit")]  # a Monday
     grid = hr.weekday_hour_heatmap(rows)

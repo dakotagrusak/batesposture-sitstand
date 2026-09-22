@@ -12,7 +12,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from statistics import mean
+from statistics import mean, pstdev
 
 LOST_POSE_THRESHOLD = 1.0
 MODES = ("sit", "stand")
@@ -26,6 +26,16 @@ LOOKBACKS = (
     "Last 30 days",
     "All history",
 )
+
+CANDLE_INTERVALS = (
+    ("1 minute", 1),
+    ("5 minutes", 5),
+)
+
+# Bollinger-style band defaults: a rolling mean over the trailing `window`
+# candles, bounded by +/- `num_std` standard deviations of that same window.
+BOLLINGER_WINDOW = 20
+BOLLINGER_NUM_STD = 2.0
 
 _FIXED_SPANS = {
     "Last 24 hours": timedelta(hours=24),
@@ -175,6 +185,78 @@ def timeseries_by_mode(
             buckets.setdefault(_bucket_start(r.dt, bucket_minutes), []).append(r.score)
         result[mode] = [(t, mean(scores)) for t, scores in sorted(buckets.items())]
     return result
+
+
+@dataclass(frozen=True)
+class OHLCBar:
+    t: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    n: int
+
+
+def ohlc_by_mode(rows: list[HistoryRow], bucket_minutes: int) -> dict[str, list[OHLCBar]]:
+    """Open/high/low/close per bucket, per mode — candlestick input.
+
+    Open is the first tracked score chronologically in the bucket, close the
+    last; a bucket with a single point (e.g. 1-minute candles over 1-minute
+    logging) has open == high == low == close.
+    """
+    tracked = [r for r in rows if not r.lost]
+    result: dict[str, list[OHLCBar]] = {}
+    for mode in MODES:
+        subset = sorted((r for r in tracked if r.mode == mode), key=lambda r: r.dt)
+        buckets: dict[datetime, list[float]] = {}
+        for r in subset:
+            buckets.setdefault(_bucket_start(r.dt, bucket_minutes), []).append(r.score)
+        bars = [
+            OHLCBar(
+                t=t,
+                open=scores[0],
+                high=max(scores),
+                low=min(scores),
+                close=scores[-1],
+                n=len(scores),
+            )
+            for t, scores in sorted(buckets.items())
+        ]
+        result[mode] = bars
+    return result
+
+
+@dataclass(frozen=True)
+class BollingerBand:
+    t: datetime
+    mean: float
+    upper: float
+    lower: float
+
+
+def bollinger_bands(
+    values: list[tuple[datetime, float]],
+    window: int = BOLLINGER_WINDOW,
+    num_std: float = BOLLINGER_NUM_STD,
+) -> list[BollingerBand]:
+    """Rolling mean +/- num_std * stddev over a trailing window of points.
+
+    Same shape as a financial Bollinger Band: the middle line is a simple
+    moving average of the last `window` values, and the bounds are that
+    average +/- `num_std` standard deviations computed over the same window.
+    """
+    scores = [v for _, v in values]
+    bands: list[BollingerBand] = []
+    for i in range(len(values)):
+        segment = scores[max(0, i - window + 1) : i + 1]
+        if len(segment) < 2:
+            continue
+        m = mean(segment)
+        sd = pstdev(segment)
+        bands.append(
+            BollingerBand(t=values[i][0], mean=m, upper=m + num_std * sd, lower=m - num_std * sd)
+        )
+    return bands
 
 
 def daily_means(rows: list[HistoryRow]) -> dict[str, list[tuple[date, float]]]:
