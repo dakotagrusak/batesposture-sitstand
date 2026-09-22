@@ -78,3 +78,27 @@ def test_export_scores_csv_returns_empty_path_on_write_failure(db_manager, monke
 def test_close_is_idempotent(db_manager):
     db_manager.close()
     db_manager.close()
+
+
+def test_has_any_scores_reflects_rows(db_manager):
+    assert db_manager.has_any_scores() is False
+    db_manager.cursor.execute(
+        "INSERT INTO posture_scores (timestamp, score, mode) VALUES (?, ?, ?)",
+        ("2026-01-01T12:00:00", 80.0, "sit"),
+    )
+    assert db_manager.has_any_scores() is True
+
+
+def test_fetch_scores_returns_rows_ordered_by_timestamp(db_manager):
+    db_manager.cursor.executemany(
+        "INSERT INTO posture_scores (timestamp, score, mode) VALUES (?, ?, ?)",
+        [
+            ("2026-01-01T13:00:00", 90.0, "stand"),
+            ("2026-01-01T12:00:00", 80.0, "sit"),
+        ],
+    )
+    rows = db_manager.fetch_scores()
+    assert rows == [
+        ("2026-01-01T12:00:00", 80.0, "sit"),
+        ("2026-01-01T13:00:00", 90.0, "stand"),
+    ]

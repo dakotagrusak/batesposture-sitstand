@@ -146,6 +146,30 @@ class Database:
             logger.exception("Failed to flush posture data to database")
             return False
 
+    def has_any_scores(self) -> bool:
+        """True if posture_scores has at least one row."""
+        try:
+            row = self._active_cursor().execute(
+                "SELECT 1 FROM posture_scores LIMIT 1"
+            ).fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
+
+    def fetch_scores(self, since_iso: str | None = None) -> list[tuple]:
+        """Return (timestamp, score, mode) rows since *since_iso*, oldest first."""
+        query = "SELECT timestamp, score, mode FROM posture_scores"
+        params: tuple = ()
+        if since_iso:
+            query += " WHERE timestamp >= ?"
+            params = (since_iso,)
+        query += " ORDER BY timestamp"
+        try:
+            return self._active_cursor().execute(query, params).fetchall()
+        except sqlite3.Error:
+            logger.exception("Failed to fetch scores")
+            return []
+
     def get_recent_stats(self, since_iso: str) -> dict | None:
         """Return aggregate score stats since *since_iso* (ISO-format timestamp)."""
         try:

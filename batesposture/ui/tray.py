@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta
 
 from PyQt6.QtCore import Qt
@@ -35,6 +36,7 @@ from ..services.settings_service import (
 )
 from ..services.task_scheduler import TaskScheduler
 from .dashboard import PostureDashboard
+from .history import HistoryDialog
 from .onboarding import run_onboarding_if_needed
 from .score_icon import create_score_icon
 from .settings_dialog import SettingsDialog
@@ -81,6 +83,7 @@ class PostureTrackerTray(QSystemTrayIcon):
 
         self.tracking_enabled = False
         self.video_window: PostureDashboard | None = None
+        self.history_window: HistoryDialog | None = None
         self.tracking_interval = settings.runtime.selected_tracking_interval
         self.last_tracking_time: datetime | None = None
         self.last_db_save: datetime | None = None
@@ -232,6 +235,16 @@ class PostureTrackerTray(QSystemTrayIcon):
         self.export_action.triggered.connect(self._export_csv)
         self.export_action.setEnabled(runtime.enable_database_logging)
         menu.addAction(self.export_action)
+
+        self.history_action = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView),
+            "History…",
+            menu,
+        )
+        self.history_action.triggered.connect(self._open_history)
+        self.history_action.setEnabled(self._history_available())
+        menu.addAction(self.history_action)
+        menu.aboutToShow.connect(self._refresh_history_action_enabled)
 
         menu.addSeparator()
         quit_action = QAction(
@@ -634,6 +647,39 @@ class PostureTrackerTray(QSystemTrayIcon):
         else:
             QMessageBox.warning(None, "Export failed", "Could not write CSV file.")
 
+    def _history_available(self) -> bool:
+        """True once the database file has at least one logged score.
+
+        Checked without disturbing self._database, which is only open while
+        Database Logging is on; History should stay usable even when it's off.
+        """
+        db_path = self._settings.resources.default_db_name
+        if not os.path.exists(db_path):
+            return False
+        try:
+            database = Database.from_settings(self._settings)
+        except DatabaseInitializationError:
+            return False
+        try:
+            return database.has_any_scores()
+        finally:
+            database.close()
+
+    def _refresh_history_action_enabled(self) -> None:
+        self.history_action.setEnabled(self._history_available())
+
+    def _open_history(self) -> None:
+        if self.history_window is None:
+            self.history_window = HistoryDialog(self._settings)
+            self.history_window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+            self.history_window.destroyed.connect(self._on_history_closed)
+        self.history_window.show()
+        self.history_window.raise_()
+        self.history_window.activateWindow()
+
+    def _on_history_closed(self) -> None:
+        self.history_window = None
+
     # ------------------------
     # Menu callbacks
     # ------------------------
@@ -854,6 +900,9 @@ class PostureTrackerTray(QSystemTrayIcon):
         if self.video_window:
             self.video_window.close()
             self.video_window = None
+        if self.history_window:
+            self.history_window.close()
+            self.history_window = None
         self._scheduler.shutdown()
         if self._database:
             self._database.close()

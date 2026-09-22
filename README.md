@@ -40,6 +40,17 @@ This fork adds:
 - Bug fixes uncovered while wiring that feature up: a presence-debounce edge
   case that could never confirm on a zero-second threshold, a return-prompt
   dialog that could block indefinitely, and stale test fixtures.
+- **Windows Hello compatibility** — the camera is released while the Windows
+  lock screen is up and reopened on unlock, so signing back in with Hello no
+  longer fights BatesPosture for the webcam. See the Troubleshooting section.
+- **History window** (tray → **History…**) — a local report over logged
+  scores: lookback ranges from Today to All history, sit/stand kept as
+  separate series throughout (never averaged together), a score-over-time
+  chart, daily and hour-of-day means, a weekday × hour heatmap, a score
+  histogram, and a recent-rows table that flags lost-pose reads instead of
+  treating them as slumped posture. You can merge in an older CSV export and
+  re-export the merged history. Everything here reads the local SQLite
+  database — no server, no account.
 
 It intentionally does **not** add a sit/stand classifier — the webcam framing
 can only hint which mode you're in, and the user confirms.
@@ -62,6 +73,7 @@ can be proposed back upstream via pull request later.
 | Adaptive processing | Frame-size and performance controls for slower hardware |
 | Auto-pause | Away-from-desk time is excluded when no person is detected |
 | Sit / stand modes | Separate sitting and standing baselines, tray switch, return prompt, CSV `mode` column |
+| History window | Lookback report over logged scores: timeline, daily/hourly means, heatmap, histogram |
 
 ![BatesPosture onboarding calibration screen using a synthetic preview](docs/assets/onboarding.png)
 
