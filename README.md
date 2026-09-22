@@ -209,6 +209,13 @@ uv build
 - **Tracking pauses:** make sure the head and shoulders are visible and evenly lit.
 - **Performance is poor:** lower FPS or frame size and enable adaptive resolution.
 - **CSV export is empty:** enable database logging before recording a session.
+- **Windows Hello won't open the camera while tracking is on:** OpenCV holds
+  an exclusive lock on the webcam while a session is active, and Hello can't
+  take the device from another app. BatesPosture releases the camera as soon
+  as the lock screen appears and reopens it automatically on unlock, so
+  locking your PC and signing back in with Hello should just work. If you're
+  on a version from before that change, the workaround is to stop tracking
+  from the tray menu before locking the PC.
 
 ## License
 

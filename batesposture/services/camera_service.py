@@ -12,6 +12,7 @@ import cv2
 
 from .camera_capture import open_camera
 from .settings_service import SettingsService
+from .windows_session import session_locked
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class CameraService:
         self._latest_pose_results = None
         self._settings_lock = threading.Lock()
         self._processing_lock = threading.Lock()
+        self._released_for_hello = False
 
     def start(self, callback: FrameCallback | None = None) -> bool:
         if self._is_running.is_set():
@@ -54,17 +56,20 @@ class CameraService:
     def stop(self) -> None:
         self._is_running.clear()
         thread = self._thread
-        capture = self._cap
         if thread and thread != threading.current_thread():
             thread.join(timeout=2.0)
             if thread.is_alive():
                 logger.warning("Camera thread did not stop within 2 seconds")
-        if capture:
-            capture.release()
-        self._cap = None
+        self._release_device()
         self._thread = None
         self._paused.clear()
         logger.info("Camera stopped")
+
+    def _release_device(self) -> None:
+        capture = self._cap
+        self._cap = None
+        if capture:
+            capture.release()
 
     def reload_settings(self) -> None:
         runtime = self._settings.runtime
@@ -107,15 +112,35 @@ class CameraService:
                 time.sleep(0.01)
                 continue
 
+            if session_locked():
+                if self._cap is not None:
+                    self._release_device()
+                    self._released_for_hello = True
+                    logger.info("Windows lock screen active; released camera for Hello")
+                time.sleep(0.4)
+                continue
+
+            if self._cap is None:
+                self._cap = open_camera(self._camera_id)
+                if self._cap is None:
+                    time.sleep(1.0)
+                    continue
+                if self._released_for_hello:
+                    logger.info(
+                        "Camera %s reopened after Windows Hello released it",
+                        self._camera_id,
+                    )
+                    self._released_for_hello = False
+                continue
+
             start_time = time.monotonic()
             try:
-                if self._cap is None:
-                    break
                 ret, frame = self._cap.read()
                 if not ret:
-                    logger.warning("Failed to read frame from camera; stopping capture")
-                    self.stop()
-                    break
+                    logger.warning("Failed to read frame from camera; releasing and retrying")
+                    self._release_device()
+                    time.sleep(0.5)
+                    continue
 
                 latest_score = 0.0
                 pose_results = None
@@ -132,9 +157,10 @@ class CameraService:
                     self._latest_pose_results = pose_results
 
             except (cv2.error, OSError) as exc:
-                logger.error("Camera I/O error in capture loop; stopping: %s", exc)
-                self.stop()
-                break
+                logger.error("Camera I/O error in capture loop; releasing and retrying: %s", exc)
+                self._release_device()
+                time.sleep(0.5)
+                continue
             except Exception:  # noqa: BLE001
                 logger.exception("Unexpected non-IO error in capture loop; stopping")
                 self.stop()
