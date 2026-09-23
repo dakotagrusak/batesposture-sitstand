@@ -51,11 +51,15 @@ This fork adds:
   treating them as slumped posture. You can merge in an older CSV export and
   re-export the merged history. Everything here reads the local SQLite
   database — no server, no account.
-- **Candles & Scatter tab** (inside History) — the same logged scores as
-  1-minute or 5-minute OHLC candlesticks (colored by whether the candle
-  closed up or down) or as a raw scatter of every point, either way overlaid
-  with a Bollinger-style band: a rolling mean ± 2 standard deviations over
-  the trailing 20 candles, computed separately per mode.
+- **Distribution tab** (inside History) — by default a scatter of every
+  tracked score (lost-pose reads left out) in separate sit and stand panels,
+  with a thin rolling mean over the trailing 11 samples, so swings inside a
+  few minutes stay visible. The Chart dropdown still offers 1-minute or
+  5-minute OHLC candlesticks (colored by whether the candle closed up or
+  down) with a Bollinger-style band: a rolling mean ± 2 standard deviations
+  over the trailing 20 candles, computed separately per mode. The Overview's
+  score-over-time chart also draws the raw samples faintly under its mean
+  line.
 - **Ctrl+Alt+T global hotkey** — starts tracking from anywhere, not just
   while a BatesPosture window has focus. Unlike the sit/stand hotkeys above
   (which are ordinary Qt menu shortcuts and only fire while a BatesPosture

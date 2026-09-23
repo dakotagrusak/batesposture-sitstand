@@ -65,6 +65,16 @@ def test_candle_tab_renders_for_both_chart_types_and_intervals(qapp, tmp_path):
     dialog.lookback_combo.setCurrentText("All history")
     qapp.processEvents()
 
+    # Distribution tab defaults to a sit/stand scatter; interval is candles-only.
+    assert dialog.tabs.tabText(1) == "Distribution"
+    assert dialog.chart_type_combo.currentText() == "Scatter"
+    assert len(dialog.candle_figure.axes) == 2
+    assert dialog.candle_figure.axes[0].get_ylim() == (0, 100)
+    assert dialog.interval_combo.isHidden()
+    dialog.chart_type_combo.setCurrentText("Candlestick")
+    qapp.processEvents()
+    assert not dialog.interval_combo.isHidden()
+
     for interval_label in ("1 minute", "5 minutes"):
         dialog.interval_combo.setCurrentText(interval_label)
         for chart_type in ("Candlestick", "Scatter"):

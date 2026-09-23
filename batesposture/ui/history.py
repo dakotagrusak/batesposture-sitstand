@@ -6,7 +6,7 @@ server."""
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import matplotlib.dates as mdates
 import numpy as np
@@ -43,7 +43,9 @@ STAND_COLOR = "#8aa4b0"
 UP_COLOR = "#6fae6f"
 DOWN_COLOR = "#c07a72"
 WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-CHART_TYPES = ("Candlestick", "Scatter")
+CHART_TYPES = ("Scatter", "Candlestick")  # first item is the default
+# Scatter rolling mean: trailing window in tracked samples (not clock time).
+SCATTER_MEAN_WINDOW = 11
 
 
 class HistoryDialog(QDialog):
@@ -84,7 +86,7 @@ class HistoryDialog(QDialog):
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, stretch=1)
         self.tabs.addTab(self._build_overview_tab(), "Overview")
-        self.tabs.addTab(self._build_candles_tab(), "Candles && Scatter")
+        self.tabs.addTab(self._build_candles_tab(), "Distribution")
 
         self._refresh()
 
@@ -132,7 +134,8 @@ class HistoryDialog(QDialog):
         self.chart_type_combo.currentTextChanged.connect(self._update_candles_view)
         controls.addWidget(self.chart_type_combo)
 
-        controls.addWidget(QLabel("Candle interval:"))
+        self.interval_label = QLabel("Candle interval:")
+        controls.addWidget(self.interval_label)
         self.interval_combo = QComboBox()
         self.interval_combo.addItems([label for label, _ in hr.CANDLE_INTERVALS])
         self.interval_combo.currentTextChanged.connect(self._update_candles_view)
@@ -140,12 +143,9 @@ class HistoryDialog(QDialog):
         controls.addStretch(1)
         tab_layout.addLayout(controls)
 
-        note = QLabel(
-            f"Band = rolling mean ± {hr.BOLLINGER_NUM_STD:g} std dev over the "
-            f"trailing {hr.BOLLINGER_WINDOW} candles (Bollinger-style)."
-        )
-        note.setStyleSheet(f"color: {GRID};")
-        tab_layout.addWidget(note)
+        self.candle_note = QLabel()
+        self.candle_note.setStyleSheet(f"color: {GRID};")
+        tab_layout.addWidget(self.candle_note)
 
         self.candle_figure = Figure(figsize=(9, 6.5), facecolor=BG)
         self.candle_canvas = FigureCanvasQTAgg(self.candle_figure)
@@ -255,7 +255,17 @@ class HistoryDialog(QDialog):
 
         ax_time = self.figure.add_subplot(gs[0, :])
         self._style_axes(ax_time)
+        raw = hr.timeseries_by_mode(rows, bucket_minutes=None)
         for mode, color in (("sit", SIT_COLOR), ("stand", STAND_COLOR)):
+            # Faint cloud of every tracked sample under the mean line.
+            ax_time.scatter(
+                [t for t, _ in raw[mode]],
+                [s for _, s in raw[mode]],
+                s=8,
+                color=color,
+                alpha=0.25,
+                edgecolors="none",
+            )
             series = timeline[mode]
             if series:
                 xs, ys = zip(*series)
@@ -320,6 +330,19 @@ class HistoryDialog(QDialog):
         rows = self._visible_rows
         interval_minutes = self._selected_interval_minutes()
         chart_type = self.chart_type_combo.currentText()
+        is_candles = chart_type == "Candlestick"
+        self.interval_label.setVisible(is_candles)
+        self.interval_combo.setVisible(is_candles)
+        if is_candles:
+            self.candle_note.setText(
+                f"Band = rolling mean ± {hr.BOLLINGER_NUM_STD:g} std dev over the "
+                f"trailing {hr.BOLLINGER_WINDOW} candles (Bollinger-style)."
+            )
+        else:
+            self.candle_note.setText(
+                f"Every tracked sample (lost-pose reads left out). Line = mean of "
+                f"the trailing {SCATTER_MEAN_WINDOW} samples."
+            )
 
         self.candle_figure.clear()
         self.candle_figure.set_facecolor(BG)
@@ -327,9 +350,8 @@ class HistoryDialog(QDialog):
             self.candle_canvas.draw()
             return
 
-        ohlc = hr.ohlc_by_mode(rows, interval_minutes)
-
-        if chart_type == "Candlestick":
+        if is_candles:
+            ohlc = hr.ohlc_by_mode(rows, interval_minutes)
             axes = self.candle_figure.subplots(2, 1, sharex=False)
             for ax, mode, band_color in zip(axes, hr.MODES, (SIT_COLOR, STAND_COLOR)):
                 self._style_axes(ax)
@@ -346,25 +368,32 @@ class HistoryDialog(QDialog):
                 )
             self.candle_figure.subplots_adjust(hspace=0.6)
         else:
-            ax = self.candle_figure.add_subplot(1, 1, 1)
-            self._style_axes(ax)
             points = hr.timeseries_by_mode(rows, bucket_minutes=None)
-            for mode, color in (("sit", SIT_COLOR), ("stand", STAND_COLOR)):
+            axes = self.candle_figure.subplots(2, 1, sharex=True)
+            for ax, mode, color in zip(
+                axes, hr.MODES, (SIT_COLOR, STAND_COLOR), strict=True
+            ):
+                self._style_axes(ax)
                 series = points[mode]
                 if series:
-                    xs = [mdates.date2num(t) for t, _ in series]
+                    xs = [t for t, _ in series]
                     ys = [s for _, s in series]
-                    ax.scatter(xs, ys, s=10, color=color, alpha=0.6, label=mode.capitalize())
-                closes = [(bar.t, bar.close) for bar in ohlc[mode]]
-                self._draw_bollinger(ax, hr.bollinger_bands(closes), color)
-            ax.xaxis_date()
-            ax.tick_params(axis="x", rotation=20, labelsize=6)
-            ax.legend(facecolor=BG, labelcolor=FG, fontsize=8, framealpha=0)
-            ax.set_title(
-                f"Raw points — band from {interval_minutes}min candles",
-                color=FG,
-                fontsize=9,
-            )
+                    ax.scatter(xs, ys, s=14, color=color, alpha=0.55, edgecolors="none")
+                    self._draw_rolling_mean(ax, xs, ys)
+                ax.set_ylim(0, 100)
+                ax.xaxis_date()
+                ax.tick_params(axis="x", rotation=20, labelsize=6)
+                ax.set_title(
+                    f"{mode.capitalize()} — {len(series)} tracked points",
+                    color=FG,
+                    fontsize=9,
+                )
+            times = [t for mode in hr.MODES for t, _ in points[mode]]
+            if times and min(times) == max(times):
+                # A lone sample would otherwise get matplotlib's +/-2 year padding.
+                pad = timedelta(minutes=30)
+                axes[0].set_xlim(times[0] - pad, times[0] + pad)
+            self.candle_figure.subplots_adjust(hspace=0.35)
 
         self.candle_canvas.draw()
 
@@ -391,6 +420,27 @@ class HistoryDialog(QDialog):
         lowers = [b.lower for b in bands]
         ax.plot(xs, means, color=color, linewidth=1.0, linestyle="--", alpha=0.9)
         ax.fill_between(xs, lowers, uppers, color=color, alpha=0.15)
+
+    def _draw_rolling_mean(self, ax, xs: list[datetime], ys: list[float]) -> None:
+        """Trailing mean of SCATTER_MEAN_WINDOW samples, restarted after any gap
+        longer than 3x the typical logging step so no line bridges empty time."""
+        window = SCATTER_MEAN_WINDOW
+        if len(ys) < window:
+            return
+        times = np.array(xs, dtype="datetime64[s]")
+        steps = np.diff(times)
+        breaks = np.flatnonzero(steps > 3 * np.median(steps)) + 1
+        kernel = np.ones(window) / window
+        runs = zip(np.split(times, breaks), np.split(np.array(ys), breaks), strict=True)
+        for run_t, run_y in runs:
+            if len(run_y) >= window:
+                ax.plot(
+                    run_t[window - 1 :],
+                    np.convolve(run_y, kernel, mode="valid"),
+                    color=FG,
+                    linewidth=0.8,
+                    alpha=0.8,
+                )
 
     def _update_table(self, rows: list[hr.HistoryRow]) -> None:
         recent = rows[-40:]
