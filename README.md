@@ -51,6 +51,17 @@ This fork adds:
   treating them as slumped posture. You can merge in an older CSV export and
   re-export the merged history. Everything here reads the local SQLite
   database — no server, no account.
+- **Candles & Scatter tab** (inside History) — the same logged scores as
+  1-minute or 5-minute OHLC candlesticks (colored by whether the candle
+  closed up or down) or as a raw scatter of every point, either way overlaid
+  with a Bollinger-style band: a rolling mean ± 2 standard deviations over
+  the trailing 20 candles, computed separately per mode.
+- **Ctrl+Alt+T global hotkey** — starts tracking from anywhere, not just
+  while a BatesPosture window has focus. Unlike the sit/stand hotkeys above
+  (which are ordinary Qt menu shortcuts and only fire while a BatesPosture
+  window is focused), this one is registered with Windows itself
+  (`RegisterHotKey`), so it works while any other application is focused, as
+  long as you're logged in. Windows only; a no-op elsewhere.
 
 It intentionally does **not** add a sit/stand classifier — the webcam framing
 can only hint which mode you're in, and the user confirms.

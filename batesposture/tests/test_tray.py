@@ -126,6 +126,11 @@ def _build_tray(tmp_path, monkeypatch):
     monkeypatch.setattr(
         tray_module.PostureTrackerTray, "setVisible", lambda self, visible: None
     )
+    # Never let a test register a real system-wide hotkey on the dev machine.
+    monkeypatch.setattr(
+        tray_module.GlobalHotkeyManager, "register", lambda self, *a, **k: False
+    )
+    monkeypatch.setattr(tray_module.GlobalHotkeyManager, "unregister_all", lambda self: None)
 
     settings = SettingsService.for_testing(tmp_path / "tray_settings.ini")
     detector = DummyDetector()

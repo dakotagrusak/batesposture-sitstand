@@ -19,6 +19,7 @@ from ..data.database import Database, DatabaseInitializationError
 from ..ml.pose_detector import PoseDetectionResult, PoseDetector
 from ..services.camera_capture import discover_camera_ids
 from ..services.camera_service import CameraService
+from ..services.global_hotkey import MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, GlobalHotkeyManager
 from ..services.notification_service import NotificationService
 from ..services.score_service import ScoreService
 from ..services.posture_mode import (
@@ -98,14 +99,29 @@ class PostureTrackerTray(QSystemTrayIcon):
         self._open_dashboard_on_first_tracking = False
         self._mode_prompt_open = False
         self._pending_return_prompt = False
+        self._hotkeys = GlobalHotkeyManager()
 
         self._initialize_application()
         self._run_onboarding_if_needed()
         self._setup_tray_menu()
+        self._register_global_hotkeys()
         self._show_onboarding_handoff()
         self._scheduler.schedule("frame", 100, self._update_tracking)
         self._scheduler.schedule("interval", 1000, self._check_interval)
         self._setup_signal_handling()
+
+    def _register_global_hotkeys(self) -> None:
+        registered = self._hotkeys.register(
+            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+            ord("T"),
+            self._start_tracking_via_hotkey,
+        )
+        if not registered and self._hotkeys.supported:
+            logger.warning("Could not register Ctrl+Alt+T global hotkey")
+
+    def _start_tracking_via_hotkey(self) -> None:
+        if not self.tracking_enabled:
+            self._start_tracking()
 
     def _initialize_application(self) -> None:
         app = QApplication.instance()
@@ -152,6 +168,10 @@ class PostureTrackerTray(QSystemTrayIcon):
             self,
         )
         self.toggle_tracking_action.triggered.connect(self.toggle_tracking)
+        if self._hotkeys.supported:
+            self.toggle_tracking_action.setToolTip(
+                "Also starts from anywhere with Ctrl+Alt+T"
+            )
 
         self.toggle_dashboard_action = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_DesktopIcon),
@@ -895,6 +915,7 @@ class PostureTrackerTray(QSystemTrayIcon):
     # Shutdown
     # ------------------------
     def quit_application(self) -> None:
+        self._hotkeys.unregister_all()
         if self.tracking_enabled:
             self.toggle_tracking()
         if self.video_window:
