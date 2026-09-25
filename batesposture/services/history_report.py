@@ -37,6 +37,12 @@ CANDLE_INTERVALS = (
 BOLLINGER_WINDOW = 20
 BOLLINGER_NUM_STD = 2.0
 
+# A slump is a tracked score below this, inside one session. Matches the
+# default poor-posture alert so History and live alerts describe the same thing.
+SLUMP_THRESHOLD = 60.0
+SESSION_GAP_MULT = 3.0
+MIN_SLUMP_POINTS = 2
+
 _FIXED_SPANS = {
     "Last 24 hours": timedelta(hours=24),
     "Last 3 days": timedelta(days=3),
@@ -150,7 +156,7 @@ def lookback_span(
 def bucket_minutes_for(
     rows: list[HistoryRow], label: str, now: datetime | None = None
 ) -> int | None:
-    """None means "too few points to bucket — plot raw samples"."""
+    """None means \"too few points to bucket — plot raw samples\"."""
     tracked = [r for r in rows if not r.lost]
     if len(tracked) < 40:
         return None
@@ -344,6 +350,149 @@ def compute_stats(rows: list[HistoryRow]) -> dict:
         "stand": _agg([r for r in tracked if r.mode == "stand"]),
         "delta": early_late_delta(tracked),
     }
+
+
+@dataclass(frozen=True)
+class CoverageSpan:
+    """One stretch of the clock: tracking, lost pose, or a hole in the log."""
+
+    start: datetime
+    end: datetime
+    state: str  # "tracked" | "lost" | "gap"
+
+
+def _median_step_seconds(rows: list[HistoryRow]) -> float:
+    deltas = sorted(
+        (b.dt - a.dt).total_seconds()
+        for a, b in zip(rows, rows[1:])
+        if (b.dt - a.dt).total_seconds() > 0
+    )
+    if not deltas:
+        return 60.0
+    # Drop the longest quarter so a lunch hole does not become "the" step.
+    keep = deltas[: max(1, int(len(deltas) * 0.75))]
+    return float(keep[len(keep) // 2])
+
+
+def coverage_spans(
+    rows: list[HistoryRow], gap_mult: float = SESSION_GAP_MULT
+) -> list[CoverageSpan]:
+    """Sessionize the raw log into tracked / lost-pose / gap spans.
+
+    Gaps are holes longer than ``gap_mult`` times the median step. They are
+    not slumps — tracking was off (lock screen, Stop tracking, walked away).
+    """
+    ordered = sorted(rows, key=lambda r: r.dt)
+    if not ordered:
+        return []
+    step = _median_step_seconds(ordered)
+    cut = max(step * gap_mult, step + 1)
+    spans: list[CoverageSpan] = []
+    run_start = ordered[0]
+    prev = ordered[0]
+
+    def _flush(start: HistoryRow, end: HistoryRow) -> None:
+        state = "lost" if start.lost else "tracked"
+        # A mixed run is split at the first state change by the loop below.
+        spans.append(CoverageSpan(start=start.dt, end=end.dt, state=state))
+
+    for row in ordered[1:]:
+        gap = (row.dt - prev.dt).total_seconds()
+        same_state = row.lost == run_start.lost
+        if gap > cut:
+            _flush(run_start, prev)
+            spans.append(CoverageSpan(start=prev.dt, end=row.dt, state="gap"))
+            run_start = row
+        elif not same_state:
+            _flush(run_start, prev)
+            run_start = row
+        prev = row
+    _flush(run_start, prev)
+    return spans
+
+
+@dataclass(frozen=True)
+class SlumpEpisode:
+    start: datetime
+    end: datetime
+    mode: str
+    n: int
+    min_score: float
+    duration_s: float
+
+
+def slump_episodes(
+    rows: list[HistoryRow],
+    threshold: float = SLUMP_THRESHOLD,
+    min_points: int = MIN_SLUMP_POINTS,
+    gap_mult: float = SESSION_GAP_MULT,
+) -> list[SlumpEpisode]:
+    """Runs of tracked scores below ``threshold``, never crossing a session gap.
+
+    Lost-pose rows are skipped. A lunch-sized hole ends the episode rather
+    than stretching it across empty time.
+    """
+    tracked = sorted((r for r in rows if not r.lost), key=lambda r: r.dt)
+    if not tracked:
+        return []
+    step = _median_step_seconds(tracked)
+    cut = max(step * gap_mult, step + 1)
+    episodes: list[SlumpEpisode] = []
+
+    current: list[HistoryRow] = []
+
+    def _close() -> None:
+        if len(current) < min_points:
+            current.clear()
+            return
+        start, end = current[0], current[-1]
+        episodes.append(
+            SlumpEpisode(
+                start=start.dt,
+                end=end.dt,
+                mode=start.mode,
+                n=len(current),
+                min_score=min(r.score for r in current),
+                duration_s=(end.dt - start.dt).total_seconds() or step,
+            )
+        )
+        current.clear()
+
+    prev: HistoryRow | None = None
+    for row in tracked:
+        if prev is not None and (row.dt - prev.dt).total_seconds() > cut:
+            _close()
+        if row.score < threshold and (not current or current[0].mode == row.mode):
+            current.append(row)
+        else:
+            _close()
+            if row.score < threshold:
+                current.append(row)
+        prev = row
+    _close()
+    return episodes
+
+
+def slump_duration_histogram(
+    episodes: list[SlumpEpisode],
+) -> dict[str, list[tuple[float, int]]]:
+    """Duration buckets in minutes, per mode. Edges: 1, 2, 5, 10, 20, 40+."""
+    edges = (1.0, 2.0, 5.0, 10.0, 20.0, 40.0)
+    result: dict[str, list[tuple[float, int]]] = {}
+    for mode in MODES:
+        counts = {e: 0 for e in edges}
+        for ep in episodes:
+            if ep.mode != mode:
+                continue
+            minutes = ep.duration_s / 60.0
+            bucket = edges[-1]
+            for edge in edges:
+                if minutes <= edge:
+                    bucket = edge
+                    break
+            counts[bucket] += 1
+        result[mode] = [(e, counts[e]) for e in edges]
+    return result
 
 
 def export_csv(rows: list[HistoryRow], path: str) -> None:
