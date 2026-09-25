@@ -25,7 +25,9 @@ def notification_service(settings_service):
 def test_notifies_when_below_threshold(mock_monotonic, mock_send, notification_service):
     notification_service.maybe_notify_posture(40)
     mock_send.assert_called_once_with(
-        "Please sit up straight!", "Posture Alert!", "/mock/icon.png"
+        "Sit up straight — you're slumping.",
+        "Sit up — slumping",
+        "/mock/icon.png",
     )
 
 
@@ -64,7 +66,7 @@ def test_trend_notification_fires_on_meaningful_drop(
     notification_service.maybe_notify_trend(_StubScores(decline=20.0))
     assert mock_send.call_count == 1
     args = mock_send.call_args[0]
-    assert args[1] == "Posture Trending Down"
+    assert args[1] == "Posture dropping"
 
 
 @patch("batesposture.services.notification_service.send_notification")
@@ -103,3 +105,30 @@ def test_trend_notification_disabled_in_focus_mode(
     settings_service.update_runtime(focus_mode_enabled=True)
     notification_service.maybe_notify_trend(_StubScores(decline=30.0))
     mock_send.assert_not_called()
+
+
+@patch("batesposture.services.notification_service.send_notification")
+def test_slump_repeats_while_score_stays_down(mock_send, notification_service):
+    with patch(
+        "batesposture.services.notification_service.monotonic", return_value=1000.0
+    ):
+        notification_service.maybe_notify_posture(40)
+    with patch(
+        "batesposture.services.notification_service.monotonic", return_value=1046.0
+    ):
+        notification_service.maybe_notify_posture(40)
+    assert mock_send.call_count == 2
+    assert mock_send.call_args[0][1].startswith("Still slumping")
+
+
+@patch("batesposture.services.notification_service.send_notification")
+def test_recovery_clears_slump_spell(mock_send, notification_service):
+    with patch(
+        "batesposture.services.notification_service.monotonic", return_value=1000.0
+    ):
+        notification_service.maybe_notify_posture(40)
+    with patch(
+        "batesposture.services.notification_service.monotonic", return_value=1010.0
+    ):
+        notification_service.maybe_notify_posture(90)
+    assert notification_service._slump_active is False
