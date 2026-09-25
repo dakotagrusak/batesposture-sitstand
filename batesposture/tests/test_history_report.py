@@ -146,3 +146,35 @@ def test_weekday_hour_heatmap_shape_is_7x24():
     assert all(len(day) == 24 for day in grid["sit"])
     assert grid["sit"][0][9] == 50.0
     assert grid["sit"][1][9] is None
+
+
+def test_coverage_marks_lost_pose_and_gaps():
+    rows = [
+        _row(datetime(2026, 1, 1, 9, 0), 80.0),
+        _row(datetime(2026, 1, 1, 9, 1), 0.0),
+        _row(datetime(2026, 1, 1, 12, 0), 70.0),
+    ]
+    spans = hr.coverage_spans(rows)
+    states = [s.state for s in spans]
+    assert "lost" in states
+    assert "gap" in states
+    assert "tracked" in states
+
+
+def test_slump_episodes_ignore_lost_pose_and_gaps():
+    rows = [
+        _row(datetime(2026, 1, 1, 9, 0), 50.0),
+        _row(datetime(2026, 1, 1, 9, 1), 40.0),
+        _row(datetime(2026, 1, 1, 9, 2), 0.0),
+        _row(datetime(2026, 1, 1, 12, 0), 30.0),
+        _row(datetime(2026, 1, 1, 12, 1), 80.0),
+    ]
+    episodes = hr.slump_episodes(rows, threshold=60.0)
+    assert len(episodes) == 1
+    assert episodes[0].n == 2
+    assert episodes[0].min_score == 40.0
+
+
+def test_short_dip_is_not_an_episode():
+    rows = [_row(datetime(2026, 1, 1, 9, 0), 40.0)]
+    assert hr.slump_episodes(rows, threshold=60.0) == []
