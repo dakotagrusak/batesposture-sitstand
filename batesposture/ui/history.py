@@ -87,6 +87,7 @@ class HistoryDialog(QDialog):
         layout.addWidget(self.tabs, stretch=1)
         self.tabs.addTab(self._build_overview_tab(), "Overview")
         self.tabs.addTab(self._build_candles_tab(), "Distribution")
+        self.tabs.addTab(self._build_spells_tab(), "Spells")
 
         self._refresh()
 
@@ -150,6 +151,21 @@ class HistoryDialog(QDialog):
         self.candle_figure = Figure(figsize=(9, 6.5), facecolor=BG)
         self.candle_canvas = FigureCanvasQTAgg(self.candle_figure)
         tab_layout.addWidget(self.candle_canvas, stretch=1)
+        return tab
+
+    def _build_spells_tab(self) -> QWidget:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        self.spells_note = QLabel(
+            f"A slump is a tracked score below {hr.SLUMP_THRESHOLD:.0f} inside "
+            "one session. Lunch-sized holes and lost-pose reads are not slumps."
+        )
+        self.spells_note.setWordWrap(True)
+        self.spells_note.setStyleSheet(f"color: {GRID};")
+        tab_layout.addWidget(self.spells_note)
+        self.spells_figure = Figure(figsize=(9, 6.5), facecolor=BG)
+        self.spells_canvas = FigureCanvasQTAgg(self.spells_figure)
+        tab_layout.addWidget(self.spells_canvas, stretch=1)
         return tab
 
     def _selected_interval_minutes(self) -> int:
@@ -221,6 +237,7 @@ class HistoryDialog(QDialog):
         self._update_charts(visible, label)
         self._update_table(visible)
         self._update_candles_view()
+        self._update_spells_view()
 
     def _update_stat_cards(self, stats: dict) -> None:
         def fmt(agg):
@@ -250,10 +267,13 @@ class HistoryDialog(QDialog):
         hist = hr.histogram(rows)
 
         gs = self.figure.add_gridspec(
-            3, 3, height_ratios=[2, 1.3, 1.3], hspace=0.6, wspace=0.45
+            4, 3, height_ratios=[0.45, 2, 1.3, 1.3], hspace=0.7, wspace=0.45
         )
 
-        ax_time = self.figure.add_subplot(gs[0, :])
+        ax_cover = self.figure.add_subplot(gs[0, :])
+        self._draw_coverage(ax_cover, hr.coverage_spans(rows))
+
+        ax_time = self.figure.add_subplot(gs[1, :])
         self._style_axes(ax_time)
         raw = hr.timeseries_by_mode(rows, bucket_minutes=None)
         for mode, color in (("sit", SIT_COLOR), ("stand", STAND_COLOR)):
@@ -273,7 +293,7 @@ class HistoryDialog(QDialog):
         ax_time.set_title("Score over time", color=FG, fontsize=10)
         ax_time.legend(facecolor=BG, labelcolor=FG, fontsize=8, framealpha=0)
 
-        ax_daily = self.figure.add_subplot(gs[1, 0])
+        ax_daily = self.figure.add_subplot(gs[2, 0])
         self._style_axes(ax_daily)
         for mode, color in (("sit", SIT_COLOR), ("stand", STAND_COLOR)):
             series = daily[mode]
@@ -283,7 +303,7 @@ class HistoryDialog(QDialog):
         ax_daily.set_title("Daily mean", color=FG, fontsize=9)
         ax_daily.tick_params(axis="x", rotation=45, labelsize=6)
 
-        ax_hourly = self.figure.add_subplot(gs[1, 1])
+        ax_hourly = self.figure.add_subplot(gs[2, 1])
         self._style_axes(ax_hourly)
         for mode, color in (("sit", SIT_COLOR), ("stand", STAND_COLOR)):
             series = hourly[mode]
@@ -293,7 +313,7 @@ class HistoryDialog(QDialog):
         ax_hourly.set_title("Hour-of-day mean", color=FG, fontsize=9)
         ax_hourly.set_xlim(0, 23)
 
-        ax_hist = self.figure.add_subplot(gs[1, 2])
+        ax_hist = self.figure.add_subplot(gs[2, 2])
         self._style_axes(ax_hist)
         for mode, color in (("sit", SIT_COLOR), ("stand", STAND_COLOR)):
             series = hist[mode]
@@ -303,10 +323,10 @@ class HistoryDialog(QDialog):
                 ax_hist.bar(xs, ys, width=8, color=color, alpha=0.65, label=mode.capitalize())
         ax_hist.set_title("Score histogram", color=FG, fontsize=9)
 
-        ax_heat_sit = self.figure.add_subplot(gs[2, 0:2])
+        ax_heat_sit = self.figure.add_subplot(gs[3, 0:2])
         self._render_heatmap(ax_heat_sit, heat["sit"], "Sitting — weekday x hour")
 
-        ax_heat_stand = self.figure.add_subplot(gs[2, 2])
+        ax_heat_stand = self.figure.add_subplot(gs[3, 2])
         self._render_heatmap(ax_heat_stand, heat["stand"], "Standing")
 
         self.canvas.draw()
@@ -441,6 +461,99 @@ class HistoryDialog(QDialog):
                     linewidth=0.8,
                     alpha=0.8,
                 )
+
+    def _draw_coverage(self, ax, spans: list[hr.CoverageSpan]) -> None:
+        self._style_axes(ax)
+        colors = {"tracked": "#6fae6f", "lost": "#c4a35a", "gap": "#3a3a40"}
+        if not spans:
+            ax.set_yticks([])
+            ax.set_title("Coverage", color=FG, fontsize=8)
+            return
+        for span in spans:
+            start = mdates.date2num(span.start)
+            end = mdates.date2num(span.end)
+            width = max(end - start, 1 / (24 * 60))
+            ax.add_patch(
+                Rectangle(
+                    (start, 0.15),
+                    width,
+                    0.7,
+                    color=colors.get(span.state, GRID),
+                    linewidth=0,
+                )
+            )
+        ax.set_xlim(mdates.date2num(spans[0].start), mdates.date2num(spans[-1].end))
+        ax.set_ylim(0, 1)
+        ax.set_yticks([])
+        ax.xaxis_date()
+        ax.tick_params(axis="x", labelsize=6)
+        ax.set_title(
+            "Coverage — green tracking · gold lost pose · grey gap",
+            color=FG,
+            fontsize=8,
+        )
+
+    def _update_spells_view(self) -> None:
+        rows = self._visible_rows
+        self.spells_figure.clear()
+        self.spells_figure.set_facecolor(BG)
+        if not rows:
+            self.spells_canvas.draw()
+            return
+
+        episodes = hr.slump_episodes(rows)
+        hist = hr.slump_duration_histogram(episodes)
+        gs = self.spells_figure.add_gridspec(2, 1, height_ratios=[1.4, 1], hspace=0.45)
+
+        ax_gantt = self.spells_figure.add_subplot(gs[0])
+        self._style_axes(ax_gantt)
+        colors = {"sit": SIT_COLOR, "stand": STAND_COLOR}
+        shown = episodes[-40:]
+        if shown:
+            for i, ep in enumerate(shown):
+                start = mdates.date2num(ep.start)
+                end = mdates.date2num(ep.end)
+                ax_gantt.barh(
+                    i,
+                    max(end - start, 1 / (24 * 60)),
+                    left=start,
+                    height=0.7,
+                    color=colors[ep.mode],
+                    linewidth=0,
+                )
+            ax_gantt.set_yticks([])
+            ax_gantt.xaxis_date()
+            ax_gantt.tick_params(axis="x", labelsize=6)
+            ax_gantt.invert_yaxis()
+        ax_gantt.set_title(
+            f"Slump spells ({len(episodes)} in lookback, last {len(shown)} shown)",
+            color=FG,
+            fontsize=9,
+        )
+
+        ax_hist = self.spells_figure.add_subplot(gs[1])
+        self._style_axes(ax_hist)
+        labels = ["≤1m", "≤2m", "≤5m", "≤10m", "≤20m", "40m+"]
+        x = list(range(len(labels)))
+        width = 0.35
+        sit_counts = [c for _, c in hist["sit"]]
+        stand_counts = [c for _, c in hist["stand"]]
+        ax_hist.bar(
+            [i - width / 2 for i in x], sit_counts, width, color=SIT_COLOR, label="Sit"
+        )
+        ax_hist.bar(
+            [i + width / 2 for i in x],
+            stand_counts,
+            width,
+            color=STAND_COLOR,
+            label="Stand",
+        )
+        ax_hist.set_xticks(x)
+        ax_hist.set_xticklabels(labels, fontsize=7)
+        ax_hist.legend(facecolor=BG, labelcolor=FG, fontsize=8, framealpha=0)
+        ax_hist.set_title("How long slumps last", color=FG, fontsize=9)
+
+        self.spells_canvas.draw()
 
     def _update_table(self, rows: list[hr.HistoryRow]) -> None:
         recent = rows[-40:]
