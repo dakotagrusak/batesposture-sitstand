@@ -16,7 +16,7 @@ def _plyer_notification_kwargs(
     kwargs: dict[str, object] = {
         "title": title,
         "message": message,
-        "timeout": 10,
+        "timeout": 15,
     }
     icon = Path(icon_path)
     if icon.is_file() and icon.suffix.lower() == ".ico":
