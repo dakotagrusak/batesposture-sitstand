@@ -55,17 +55,32 @@ This fork adds:
   tracked score (lost-pose reads left out) in separate sit and stand panels,
   with a thin rolling mean over the trailing 11 samples, so swings inside a
   few minutes stay visible. The Chart dropdown still offers 1-minute or
-  5-minute OHLC candlesticks (colored by whether the candle closed up or
-  down) with a Bollinger-style band: a rolling mean ± 2 standard deviations
-  over the trailing 20 candles, computed separately per mode. The Overview's
+  5-minute OHLC candlesticks (light and hollow when the candle closed up,
+  solid when it closed down) with a Bollinger-style band: a rolling mean ±
+  2 standard deviations over the trailing 20 candles, computed separately
+  per mode. The Overview's
   score-over-time chart also draws the raw samples faintly under its mean
   line.
+- **Shape tab** (inside History) — violin plots of the tracked scores, the
+  pooled "All" violin first and then one per group: time of day, minutes
+  into a session, hour of day, weekday, day, or sit/stand. Width shows how
+  often a score occurs (a smoothed histogram); the white dot is the median,
+  the box the middle half (IQR) and the thin line the full range. Each violin
+  is labeled with its sample count and a plain-language shape (symmetric,
+  left- or right-skewed, uniform-ish, bimodal, multimodal), so you can see
+  which split turns one lopsided distribution into distinct groups.
 - **Ctrl+Alt+T global hotkey** — starts tracking from anywhere, not just
   while a BatesPosture window has focus. Unlike the sit/stand hotkeys above
   (which are ordinary Qt menu shortcuts and only fire while a BatesPosture
   window is focused), this one is registered with Windows itself
   (`RegisterHotKey`), so it works while any other application is focused, as
   long as you're logged in. Windows only; a no-op elsewhere.
+- **Colorblind-friendly colors** — score bands run blue → aqua → yellow →
+  red (Excellent → Poor) instead of green → red (tray icon, dashboard,
+  sparkline and camera overlay), sit/stand are orange vs blue, and candle
+  direction is a light hollow vs solid candle rather than green vs red.
+  Every color set was checked under simulated protanopia and deuteranopia,
+  and the tray icon's white digits keep at least 3:1 contrast on every band.
 
 It intentionally does **not** add a sit/stand classifier — the webcam framing
 can only hint which mode you're in, and the user confirms.
