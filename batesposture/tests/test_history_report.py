@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from ..services import history_report as hr
 
@@ -178,3 +178,58 @@ def test_slump_episodes_ignore_lost_pose_and_gaps():
 def test_short_dip_is_not_an_episode():
     rows = [_row(datetime(2026, 1, 1, 9, 0), 40.0)]
     assert hr.slump_episodes(rows, threshold=60.0) == []
+
+
+def test_score_groups_orders_weekdays_and_drops_lost_pose():
+    rows = [
+        _row(datetime(2026, 1, 7, 9, 0), 70.0),  # Wednesday
+        _row(datetime(2026, 1, 5, 9, 0), 80.0),  # Monday
+        _row(datetime(2026, 1, 5, 9, 1), 0.0),  # Monday, lost pose
+    ]
+    assert hr.score_groups(rows, "Weekday") == [("Mon", [80.0]), ("Wed", [70.0])]
+
+
+def test_score_groups_minutes_into_session_restart_after_a_gap():
+    start = datetime(2026, 1, 5, 9, 0)
+    rows = [_row(start + timedelta(minutes=m), 70.0) for m in range(40)]
+    # Two-hour hole, then a fresh session: its first rows are early again.
+    later = start + timedelta(hours=3)
+    rows += [_row(later + timedelta(minutes=m), 90.0) for m in range(5)]
+    groups = dict(hr.score_groups(rows, "Minutes into session"))
+    assert len(groups["0–15 min"]) == 15 + 5
+    assert groups["30–45 min"] == [70.0] * 10
+    assert 90.0 in groups["0–15 min"]
+
+
+def test_describe_shape_names_common_shapes():
+    uniform = [float(i) for i in range(10, 91)]
+    bimodal = [30.0 + (i % 7) for i in range(60)]
+    bimodal += [80.0 + (i % 7) for i in range(60)]
+    symmetric = [50.0 + d for d in range(-10, 11) for _ in range(11 - abs(d))]
+    left = [95 - (i**2) / 40 for i in range(40)]
+    assert hr.describe_shape(uniform) == "uniform-ish"
+    assert hr.describe_shape(bimodal) == "bimodal"
+    assert [round(p) for p in hr.density_peaks(bimodal)] == [33, 83]
+    assert hr.describe_shape(symmetric) == "symmetric"
+    assert hr.describe_shape(left) == "left-skewed"
+    assert hr.describe_shape([50.0, 60.0]) == "too few"
+
+
+def test_minutes_into_session_uses_full_history_across_the_lookback_cutoff():
+    start = datetime(2026, 9, 25, 14, 0)
+    everything = [_row(start + timedelta(minutes=m), 70.0) for m in range(60)]
+    visible = hr.filter_lookback(
+        everything, "Last 24 hours", now=datetime(2026, 9, 26, 14, 30)
+    )
+    assert len(visible) == 30  # the window opens mid-session, at 14:30
+    groups = dict(hr.score_groups(visible, "Minutes into session", context=everything))
+    assert set(groups) == {"30–45 min", "45–60 min"}
+
+
+def test_day_labels_carry_the_year_when_history_spans_years():
+    rows = [_row(datetime(2025, 9, 26, 9), 70.0), _row(datetime(2026, 9, 26, 9), 80.0)]
+    assert hr.score_groups(rows, "Day") == [
+        ("2025-09-26", [70.0]),
+        ("2026-09-26", [80.0]),
+    ]
+    assert hr.score_groups(rows[1:], "Day") == [("09-26", [80.0])]

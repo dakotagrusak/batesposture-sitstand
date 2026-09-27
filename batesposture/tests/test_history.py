@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from ..data.database import Database
+from ..services import history_report as hr
 from ..services.settings_service import SettingsService
 from ..ui.history import HistoryDialog
 
@@ -82,4 +83,38 @@ def test_candle_tab_renders_for_both_chart_types_and_intervals(qapp, tmp_path):
             qapp.processEvents()
             assert len(dialog.candle_figure.axes) > 0
 
+    dialog.close()
+
+
+def test_shape_tab_draws_a_violin_per_group_for_every_grouping(qapp, tmp_path):
+    settings = SettingsService.for_testing(tmp_path / "history_shape_settings.ini")
+    database = Database.from_settings(settings)
+    now = datetime.now()
+    rows = [
+        (
+            (now - timedelta(minutes=i)).isoformat(),
+            40.0 + (i % 50),
+            "sit" if i % 3 else "stand",
+        )
+        for i in range(120)
+    ]
+    database.cursor.executemany(
+        "INSERT INTO posture_scores (timestamp, score, mode) VALUES (?, ?, ?)", rows
+    )
+    database.cursor.connection.commit()
+    database.close()
+
+    dialog = HistoryDialog(settings)
+    dialog.show()
+    dialog.lookback_combo.setCurrentText("All history")
+    qapp.processEvents()
+
+    assert dialog.tabs.tabText(3) == "Shape"
+    for grouping in hr.SHAPE_GROUPINGS:
+        dialog.shape_group_combo.setCurrentText(grouping)
+        qapp.processEvents()
+        (ax,) = dialog.shape_figure.axes
+        labels = [t.get_text() for t in ax.get_xticklabels()]
+        assert labels[0].startswith("All\nn=120")
+        assert all("n=" in label for label in labels)
     dialog.close()
