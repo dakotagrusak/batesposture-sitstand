@@ -239,13 +239,13 @@ class PoseDetector:
             1 - abs(spine_angle) / self.score_thresholds["spine_angle"], 0, 1
         )
 
-        ear_distance = np.linalg.norm(ears[1] - ears[0])
-        shoulder_width = np.linalg.norm(shoulders[1] - shoulders[0])
-        ideal_ear_distance = shoulder_width * 0.7
+        # Nose drifts off the ear midpoint as the head turns; dividing by the ear
+        # span keeps it independent of head/shoulder proportions. ~0 facing the
+        # camera; the 1.5 softens it for side monitors so the score reaches 0
+        # only around a 50 degree turn.
+        ear_span_x = abs(ears[1][0] - ears[0][0])
         head_rotation_score = np.clip(
-            1 - abs(ear_distance - ideal_ear_distance) / (ideal_ear_distance + 1e-6),
-            0,
-            1,
+            1 - 2 * abs(nose[0] - mid_ear[0]) / (ear_span_x + 1e-6) / 1.5, 0, 1
         )
         head_side_tilt_score = np.clip(1 - abs(ears[0][1] - ears[1][1]) * 5, 0, 1)
 
@@ -274,6 +274,7 @@ class PoseDetector:
             "shoulder_vertical_delta": float(abs(shoulder_diff[1])),
             "spine_angle": float(spine_angle),
             "head_tilt_score": float(head_tilt_score),
+            "head_rotation_score": float(head_rotation_score),
             "neck_vertical_score": float(neck_vertical_score),
             "spine_alignment_score": float(spine_alignment_score),
             "mid_shoulder_y": float(mid_shoulder[1]),

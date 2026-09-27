@@ -223,6 +223,28 @@ class TestPoseDetector:
         angle = pd.angle_between(valid_vector, invalid_vector)
         assert angle == 0.0  # Should handle zero/near-zero vectors gracefully
 
+    def test_head_rotation_uses_nose_offset(self, pd, mock_landmarks):
+        def rotation(nose_x):
+            lms = mock_landmarks(
+                {
+                    0: (nose_x, 0.3, 0),
+                    7: (0.45, 0.3, 0),
+                    8: (0.55, 0.3, 0),
+                    11: (0.40, 0.5, 0),
+                    12: (0.60, 0.5, 0),
+                    23: (0.45, 0.7, 0),
+                    24: (0.55, 0.7, 0),
+                }
+            )
+            points = np.array([[lm.x, lm.y, lm.z] for lm in lms.landmark])
+            scores = pd._compute_posture_metrics_from_points(points)
+            return scores["head_rotation_score"]
+
+        assert rotation(0.50) == pytest.approx(1.0)
+        assert rotation(0.525) == pytest.approx(2 / 3, abs=1e-3)
+        assert rotation(0.475) == pytest.approx(2 / 3, abs=1e-3)
+        assert rotation(0.58) == 0.0
+
     def test_posture_score_components(self, pd, mock_landmarks):
         """Test individual components of posture scoring"""
         # Test perfect posture
