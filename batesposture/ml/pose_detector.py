@@ -14,6 +14,7 @@ from ..services.settings_service import (
     SettingsService,
     _default_posture_thresholds,
 )
+from ..ui.theme import score_color_hex
 from .mediapipe_compat import MP_SOLUTIONS
 
 logger = logging.getLogger(__name__)
@@ -293,11 +294,10 @@ class PoseDetector:
 
     def _draw_posture_feedback(self, frame: np.ndarray, score: float) -> None:
         runtime = self._settings.runtime
-        score_color = (
-            0,
-            int(min(255, score * 2.55)),
-            int(min(255, (100 - score) * 2.55)),
-        )
+        # Same colorblind-safe bands as the tray icon; the brighter dark-theme
+        # steps read better over video. OpenCV wants BGR.
+        r, g, b = bytes.fromhex(score_color_hex(score, "dark")[1:])
+        score_color = (b, g, r)
         cv2.putText(
             frame,
             f"Posture Score: {score:.1f}%",
