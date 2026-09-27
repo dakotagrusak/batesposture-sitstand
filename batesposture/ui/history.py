@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import matplotlib.dates as mdates
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.colors import to_rgb
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from PyQt6.QtCore import Qt
@@ -38,10 +39,14 @@ logger = logging.getLogger(__name__)
 BG = "#0c0c0d"
 FG = "#e7e2da"
 GRID = "#2a2a2d"
-SIT_COLOR = "#c9b8a8"
-STAND_COLOR = "#8aa4b0"
-UP_COLOR = "#6fae6f"
-DOWN_COLOR = "#c07a72"
+MUTED = "#898781"  # secondary text; 5.3:1 on BG (GRID is too dark for text)
+# Colorblind-safe (checked under simulated protanopia/deuteranopia on BG):
+# orange vs blue for sit/stand; violet vs yellow for the coverage strip.
+SIT_COLOR = "#d95926"
+STAND_COLOR = "#3987e5"
+TRACKED_COLOR = "#9085e9"
+LOST_COLOR = "#c98500"
+GAP_COLOR = "#3a3a40"
 WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 CHART_TYPES = ("Scatter", "Candlestick")  # first item is the default
 # Scatter rolling mean: trailing window in tracked samples (not clock time).
@@ -88,6 +93,7 @@ class HistoryDialog(QDialog):
         self.tabs.addTab(self._build_overview_tab(), "Overview")
         self.tabs.addTab(self._build_candles_tab(), "Distribution")
         self.tabs.addTab(self._build_spells_tab(), "Spells")
+        self.tabs.addTab(self._build_shape_tab(), "Shape")
 
         self._refresh()
 
@@ -145,7 +151,7 @@ class HistoryDialog(QDialog):
         tab_layout.addLayout(controls)
 
         self.candle_note = QLabel()
-        self.candle_note.setStyleSheet(f"color: {GRID};")
+        self.candle_note.setStyleSheet(f"color: {MUTED};")
         tab_layout.addWidget(self.candle_note)
 
         self.candle_figure = Figure(figsize=(9, 6.5), facecolor=BG)
@@ -161,11 +167,34 @@ class HistoryDialog(QDialog):
             "one session. Lunch-sized holes and lost-pose reads are not slumps."
         )
         self.spells_note.setWordWrap(True)
-        self.spells_note.setStyleSheet(f"color: {GRID};")
+        self.spells_note.setStyleSheet(f"color: {MUTED};")
         tab_layout.addWidget(self.spells_note)
         self.spells_figure = Figure(figsize=(9, 6.5), facecolor=BG)
         self.spells_canvas = FigureCanvasQTAgg(self.spells_figure)
         tab_layout.addWidget(self.spells_canvas, stretch=1)
+        return tab
+
+    def _build_shape_tab(self) -> QWidget:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Group by:"))
+        self.shape_group_combo = QComboBox()
+        self.shape_group_combo.addItems(list(hr.SHAPE_GROUPINGS))
+        self.shape_group_combo.currentTextChanged.connect(self._update_shape_view)
+        controls.addWidget(self.shape_group_combo)
+        controls.addStretch(1)
+        tab_layout.addLayout(controls)
+
+        self.shape_note = QLabel()
+        self.shape_note.setWordWrap(True)
+        self.shape_note.setStyleSheet(f"color: {MUTED};")
+        tab_layout.addWidget(self.shape_note)
+
+        self.shape_figure = Figure(figsize=(9, 6.5), facecolor=BG)
+        self.shape_canvas = FigureCanvasQTAgg(self.shape_figure)
+        tab_layout.addWidget(self.shape_canvas, stretch=1)
         return tab
 
     def _selected_interval_minutes(self) -> int:
@@ -238,6 +267,7 @@ class HistoryDialog(QDialog):
         self._update_table(visible)
         self._update_candles_view()
         self._update_spells_view()
+        self._update_shape_view()
 
     def _update_stat_cards(self, stats: dict) -> None:
         def fmt(agg):
@@ -355,6 +385,7 @@ class HistoryDialog(QDialog):
         self.interval_combo.setVisible(is_candles)
         if is_candles:
             self.candle_note.setText(
+                f"Light hollow candle = closed higher than it opened, solid = lower. "
                 f"Band = rolling mean ± {hr.BOLLINGER_NUM_STD:g} std dev over the "
                 f"trailing {hr.BOLLINGER_WINDOW} candles (Bollinger-style)."
             )
@@ -376,7 +407,7 @@ class HistoryDialog(QDialog):
             for ax, mode, band_color in zip(axes, hr.MODES, (SIT_COLOR, STAND_COLOR)):
                 self._style_axes(ax)
                 bars = ohlc[mode]
-                self._draw_candlesticks(ax, bars, interval_minutes)
+                self._draw_candlesticks(ax, bars, interval_minutes, band_color)
                 closes = [(bar.t, bar.close) for bar in bars]
                 self._draw_bollinger(ax, hr.bollinger_bands(closes), band_color)
                 ax.xaxis_date()
@@ -418,18 +449,34 @@ class HistoryDialog(QDialog):
         self.candle_canvas.draw()
 
     def _draw_candlesticks(
-        self, ax, bars: list[hr.OHLCBar], bucket_minutes: int
+        self, ax, bars: list[hr.OHLCBar], bucket_minutes: int, color: str
     ) -> None:
+        """Up candles are a light hollow tint of the panel color, down candles
+        solid. Lightness survives color blindness and still shows when candles
+        are too narrow for hollow vs filled to render; no extra hue competes
+        with the sit/stand colors."""
         if not bars:
             return
         width = (bucket_minutes / (24 * 60)) * 0.7
+        up_color = tuple((np.array(to_rgb(color)) + to_rgb(FG)) / 2)
         for bar in bars:
             x = mdates.date2num(bar.t)
-            color = UP_COLOR if bar.close >= bar.open else DOWN_COLOR
-            ax.vlines(x, bar.low, bar.high, color=color, linewidth=0.8)
+            up = bar.close >= bar.open
+            stroke = up_color if up else color
+            ax.vlines(x, bar.low, bar.high, color=stroke, linewidth=0.8)
             lower = min(bar.open, bar.close)
             height = max(abs(bar.close - bar.open), 0.5)
-            ax.add_patch(Rectangle((x - width / 2, lower), width, height, color=color))
+            ax.add_patch(
+                Rectangle(
+                    (x - width / 2, lower),
+                    width,
+                    height,
+                    facecolor=BG if up else stroke,
+                    edgecolor=stroke,
+                    linewidth=0.8,
+                    zorder=3,  # body covers the wick, so hollow reads as hollow
+                )
+            )
 
     def _draw_bollinger(self, ax, bands: list[hr.BollingerBand], color: str) -> None:
         if not bands:
@@ -464,7 +511,7 @@ class HistoryDialog(QDialog):
 
     def _draw_coverage(self, ax, spans: list[hr.CoverageSpan]) -> None:
         self._style_axes(ax)
-        colors = {"tracked": "#6fae6f", "lost": "#c4a35a", "gap": "#3a3a40"}
+        colors = {"tracked": TRACKED_COLOR, "lost": LOST_COLOR, "gap": GAP_COLOR}
         if not spans:
             ax.set_yticks([])
             ax.set_title("Coverage", color=FG, fontsize=8)
@@ -488,7 +535,7 @@ class HistoryDialog(QDialog):
         ax.xaxis_date()
         ax.tick_params(axis="x", labelsize=6)
         ax.set_title(
-            "Coverage — green tracking · gold lost pose · grey gap",
+            "Coverage — violet tracking · yellow lost pose · grey gap",
             color=FG,
             fontsize=8,
         )
@@ -554,6 +601,82 @@ class HistoryDialog(QDialog):
         ax_hist.set_title("How long slumps last", color=FG, fontsize=9)
 
         self.spells_canvas.draw()
+
+    def _update_shape_view(self, *_args) -> None:
+        """Violin per group: width = how often a score occurs (smoothed), box =
+        middle half (IQR), white dot = median, thin line = full range."""
+        grouping = self.shape_group_combo.currentText()
+        self.shape_figure.clear()
+        self.shape_figure.set_facecolor(BG)
+        tracked = [r.score for r in self._visible_rows if not r.lost]
+        if not tracked:
+            self.shape_note.setText("No tracked scores in this lookback.")
+            self.shape_canvas.draw()
+            return
+
+        q1, med, q3 = np.percentile(tracked, [25, 50, 75])
+        self.shape_note.setText(
+            f"All tracked scores: median {med:.0f}, middle half {q1:.0f}–{q3:.0f}, "
+            f"range {min(tracked):.0f}–{max(tracked):.0f}, "
+            f"{hr.describe_shape(tracked)}. Width = how often a score occurs; "
+            "white dot = median, box = middle half, line = full range. "
+            "Two humps suggest two different situations mixed together. "
+            "Lost-pose reads are left out."
+        )
+        groups = [("All", tracked)] + hr.score_groups(
+            self._visible_rows, grouping, context=self._rows
+        )
+        colors = {"Sit": SIT_COLOR, "Stand": STAND_COLOR}
+
+        ax = self.shape_figure.add_subplot(1, 1, 1)
+        self._style_axes(ax)
+        for pos, (label, scores) in enumerate(groups, start=1):
+            color = colors.get(label, FG)
+            if len(scores) >= hr.MIN_SHAPE_POINTS and max(scores) > min(scores):
+                body = ax.violinplot(
+                    [scores], positions=[pos], widths=0.85, showextrema=False
+                )["bodies"][0]
+                body.set_facecolor(color)
+                body.set_edgecolor(color)
+                body.set_alpha(0.45)
+            else:  # too few for a density: show the points themselves
+                ax.scatter(
+                    [pos] * len(scores), scores, s=10, color=color, alpha=0.8, zorder=5
+                )
+            g_q1, g_med, g_q3 = np.percentile(scores, [25, 50, 75])
+            ax.vlines(pos, min(scores), max(scores), color=FG, linewidth=0.8)
+            ax.add_patch(
+                Rectangle(
+                    (pos - 0.05, g_q1),
+                    0.1,
+                    max(g_q3 - g_q1, 0.5),
+                    facecolor=BG,
+                    edgecolor=FG,
+                    linewidth=0.8,
+                    zorder=3,
+                )
+            )
+            ax.scatter([pos], [g_med], s=16, color="white", zorder=4)
+        ax.axvline(1.5, color=GRID, linewidth=1)  # "All" is the reference
+        ax.set_xticks(range(1, len(groups) + 1))
+        crowded = len(groups) > 12  # 3-line labels collide past this
+        sep, rotation = (" · ", 90) if crowded else ("\n", 0)
+        ax.set_xticklabels(
+            [
+                sep.join((label, f"n={len(s)}", hr.describe_shape(s)))
+                for label, s in groups
+            ],
+            fontsize=6 if crowded else 7,
+            rotation=rotation,
+        )
+        ax.set_xlim(0.4, len(groups) + 0.6)
+        ax.set_ylim(0, 100)
+        ax.set_ylabel("Score", color=FG, fontsize=8)
+        ax.set_title(
+            f"Score distribution by {grouping.lower()}", color=FG, fontsize=9
+        )
+        self.shape_figure.subplots_adjust(bottom=0.24 if crowded else 0.16)
+        self.shape_canvas.draw()
 
     def _update_table(self, rows: list[hr.HistoryRow]) -> None:
         recent = rows[-40:]

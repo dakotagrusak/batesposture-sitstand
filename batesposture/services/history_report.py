@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from statistics import mean, pstdev
 
+import numpy as np
+
 LOST_POSE_THRESHOLD = 1.0
 MODES = ("sit", "stand")
 
@@ -42,6 +44,19 @@ BOLLINGER_NUM_STD = 2.0
 SLUMP_THRESHOLD = 60.0
 SESSION_GAP_MULT = 3.0
 MIN_SLUMP_POINTS = 2
+
+# Shape tab: ways to split tracked scores into groups worth comparing. A time
+# series has no modes of its own; its samples, pooled per group, do.
+SHAPE_GROUPINGS = (
+    "Time of day",
+    "Minutes into session",
+    "Hour of day",
+    "Weekday",
+    "Day",
+    "Sit / stand",
+)
+MIN_SHAPE_POINTS = 10  # below this a density estimate is noise, not a shape
+_SESSION_BIN_EDGES = (15, 30, 45, 60)  # minutes; the last bin is 60+
 
 _FIXED_SPANS = {
     "Last 24 hours": timedelta(hours=24),
@@ -317,6 +332,148 @@ def histogram(rows: list[HistoryRow], bin_size: int = 10) -> dict[str, list[tupl
             counts[bin_start] += 1
         result[mode] = sorted(counts.items())
     return result
+
+
+def _time_of_day(dt: datetime) -> tuple[int, str]:
+    if dt.hour < 6:
+        return 0, "Night"
+    if dt.hour < 12:
+        return 1, "Morning"
+    if dt.hour < 17:
+        return 2, "Afternoon"
+    return 3, "Evening"
+
+
+_GROUP_KEYS = {
+    "Time of day": lambda r: _time_of_day(r.dt),
+    "Hour of day": lambda r: (r.dt.hour, f"{r.dt.hour:02d}:00"),
+    "Weekday": lambda r: (r.dt.weekday(), r.dt.strftime("%a")),
+    "Day": lambda r: (r.dt.date(), r.dt.strftime("%m-%d")),
+    "Sit / stand": lambda r: (MODES.index(r.mode), r.mode.capitalize()),
+}
+
+
+def _session_bin(minutes: float) -> tuple[int, str]:
+    lower = 0
+    for i, edge in enumerate(_SESSION_BIN_EDGES):
+        if minutes < edge:
+            return i, f"{lower}–{edge} min"
+        lower = edge
+    return len(_SESSION_BIN_EDGES), f"{lower}+ min"
+
+
+def _session_minutes(ordered: list[HistoryRow]) -> list[float]:
+    """Minutes since the row's session started. Sessions break on the same
+    gap rule as coverage; a lost-pose stretch does not end a session."""
+    step = _median_step_seconds(ordered)
+    cut = max(step * SESSION_GAP_MULT, step + 1)
+    minutes = []
+    start = prev = ordered[0].dt
+    for row in ordered:
+        if (row.dt - prev).total_seconds() > cut:
+            start = row.dt
+        prev = row.dt
+        minutes.append((row.dt - start).total_seconds() / 60)
+    return minutes
+
+
+def score_groups(
+    rows: list[HistoryRow],
+    grouping: str,
+    context: list[HistoryRow] | None = None,
+) -> list[tuple[str, list[float]]]:
+    """Tracked scores split by ``grouping`` (one of SHAPE_GROUPINGS), in a
+    natural order: hours ascending, Mon..Sun, sessions early to late.
+
+    ``context`` is the full history ``rows`` came from (a superset). Session
+    starts are found there, so a session already running when the lookback
+    begins keeps its real start instead of restarting at the cutoff.
+    """
+    ordered = sorted(rows, key=lambda r: r.dt)
+    if not ordered:
+        return []
+    if grouping == "Minutes into session":
+        full = sorted(context or ordered, key=lambda r: r.dt)
+        minutes = dict(zip(full, _session_minutes(full), strict=True))
+        keys = [_session_bin(minutes[r]) for r in ordered]
+    else:
+        keys = [_GROUP_KEYS[grouping](r) for r in ordered]
+    groups: dict[tuple, list[float]] = {}
+    for row, key in zip(ordered, keys, strict=True):
+        if not row.lost:
+            groups.setdefault(key, []).append(row.score)
+    result = [(label, scores) for (_, label), scores in sorted(groups.items())]
+    if grouping == "Day" and len({key[0].year for key in groups}) > 1:
+        # Month-day alone would repeat across years.
+        result = [(key[0].isoformat(), s) for key, s in sorted(groups.items())]
+    return result
+
+
+def density_peaks(scores: list[float]) -> list[float]:
+    """Scores where the smoothed density (Gaussian KDE, Scott's rule, the same
+    bandwidth the violin is drawn with) has a real peak.
+
+    ponytail: fixed heuristics, not a statistical test. A bump must reach 15%
+    of the tallest peak, and two bumps only count as separate modes when the
+    density dips at least 25% below the smaller one between them.
+    """
+    x = np.asarray(scores, dtype=float)
+    if len(x) < 2:
+        return []
+    sd = x.std(ddof=1)  # sample SD, as matplotlib's KDE uses
+    if sd == 0:
+        return []
+    bandwidth = sd * len(x) ** (-1 / 5)
+    counts, edges = np.histogram(x, bins=200, range=(0, 100))
+    centers = (edges[:-1] + edges[1:]) / 2
+    kernel = np.exp(-0.5 * ((centers[:, None] - centers[None, :]) / bandwidth) ** 2)
+    density = kernel @ counts
+    floor = 0.15 * density.max()
+    tops = [
+        i
+        for i in range(1, len(density) - 1)
+        if density[i] > density[i - 1]
+        and density[i] >= density[i + 1]
+        and density[i] >= floor
+    ]
+    if density[0] > density[1] and density[0] >= floor:
+        tops.insert(0, 0)
+    if density[-1] > density[-2] and density[-1] >= floor:
+        tops.append(len(density) - 1)
+    peaks: list[int] = []
+    for i in tops:
+        if peaks:
+            dip = density[peaks[-1] : i + 1].min()
+            if dip >= 0.75 * min(density[peaks[-1]], density[i]):
+                if density[i] > density[peaks[-1]]:
+                    peaks[-1] = i  # same mode; keep the taller top
+                continue
+        peaks.append(i)
+    return [float(centers[i]) for i in peaks]
+
+
+def describe_shape(scores: list[float]) -> str:
+    """Plain-language shape: bimodal, multimodal, uniform-ish, left-skewed,
+    right-skewed, symmetric, or "too few" below MIN_SHAPE_POINTS."""
+    if len(scores) < MIN_SHAPE_POINTS:
+        return "too few"
+    x = np.asarray(scores, dtype=float)
+    sd = x.std()
+    if sd == 0:
+        return "one value"
+    peaks = len(density_peaks(scores))
+    if peaks >= 2:
+        return "bimodal" if peaks == 2 else "multimodal"
+    z = (x - x.mean()) / sd
+    skew = float((z**3).mean())
+    excess_kurtosis = float((z**4).mean()) - 3
+    if excess_kurtosis <= -1.0:  # a uniform spread sits at -1.2
+        return "uniform-ish"
+    if skew <= -0.5:
+        return "left-skewed"
+    if skew >= 0.5:
+        return "right-skewed"
+    return "symmetric"
 
 
 def _agg(rows: list[HistoryRow]) -> dict | None:
