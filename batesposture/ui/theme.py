@@ -84,15 +84,21 @@ def score_grade(score: float) -> str:
 
 
 def score_color_hex(score: float, preference: str = "light") -> str:
-    """Return an accessible semantic color for a posture score."""
+    """Return a colorblind-safe semantic color for a posture score.
+
+    Blue -> aqua -> yellow -> red (Excellent -> Poor): every pair of bands stays
+    distinguishable under simulated protanopia and deuteranopia, unlike a
+    green -> red scale. Light steps keep >= 3:1 against the tray icon's white
+    digits and the light canvas; dark steps against the dark surfaces.
+    """
     dark = is_dark_theme(preference)
     if score >= 85:
-        return "#46b96b" if dark else "#238442"
+        return "#3987e5" if dark else "#2a78d6"
     if score >= 70:
-        return "#78bd67" if dark else "#4f8f3d"
+        return "#1baf7a" if dark else "#199e70"
     if score >= 55:
-        return "#e0ad52" if dark else "#a66b12"
-    return "#ff858b" if dark else "#c43d45"
+        return "#c98500" if dark else "#a8751f"
+    return "#d03b3b" if dark else "#b4232c"
 
 
 def settings_stylesheet(preference: str) -> str:
