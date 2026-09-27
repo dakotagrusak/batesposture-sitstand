@@ -48,8 +48,8 @@ class SparklineWidget(QWidget):
     """Score history area chart with per-segment colour coding.
 
     Displays up to 120 recent posture scores as a filled area chart. Each line
-    segment is coloured by interpolating red (0) → amber (50) → green (100) based
-    on the average of its two endpoints. Pre-populated from persisted database
+    segment is coloured by the score band of the average of its two endpoints
+    (see ``score_color_hex``). Pre-populated from persisted database
     history when the dashboard reopens, so the chart isn't blank after a restart.
     """
 
@@ -335,12 +335,8 @@ class PostureDashboard(QDialog):
         self.score_label.setStyleSheet(f"color: {color};")
         if stats and stats.get("count", 0) > 0:
             self._stat_avg.set_value(f"{stats['avg']:.0f}")
-            self._stat_min.set_value(
-                f"<span style='color:#e05050'>{stats['min']:.0f}</span>"
-            )
-            self._stat_max.set_value(
-                f"<span style='color:#4caf50'>{stats['max']:.0f}</span>"
-            )
+            self._stat_min.set_value(f"{stats['min']:.0f}")
+            self._stat_max.set_value(f"{stats['max']:.0f}")
             best = stats.get("best_streak_s", 0.0)
             streak_str = _format_duration(best) if best >= 5 else "—"
             self._stat_streak.set_value(streak_str)
