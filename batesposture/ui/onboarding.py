@@ -40,6 +40,7 @@ class CalibrationResult:
     mid_shoulder_y: float = 0.45
     shoulder_width: float = 0.25
     hip_visibility: float = 0.0
+    neck_ratio: float = 0.0
 
 
 class CameraPreviewWidget(QLabel):
@@ -160,6 +161,7 @@ class CalibrationWorker(QObject):
                 "mid_shoulder_y": [],
                 "shoulder_width": [],
                 "hip_visibility": [],
+                "neck_ratio": [],
             }
 
             while not self._stop and time.monotonic() - start_time < self._duration:
@@ -191,6 +193,7 @@ class CalibrationWorker(QObject):
                 collected["mid_shoulder_y"].append(metrics.get("mid_shoulder_y", 0.45))
                 collected["shoulder_width"].append(metrics.get("shoulder_width", 0.25))
                 collected["hip_visibility"].append(metrics.get("hip_visibility", 0.0))
+                collected["neck_ratio"].append(metrics.get("neck_ratio", 0.0))
                 self.progress_changed.emit(
                     min(99, int(elapsed / self._duration * 100)),
                     remaining,
@@ -232,6 +235,7 @@ class CalibrationWorker(QObject):
             mid_shoulder_y=float(sum(collected["mid_shoulder_y"]) / len(collected["mid_shoulder_y"])),
             shoulder_width=float(sum(collected["shoulder_width"]) / len(collected["shoulder_width"])),
             hip_visibility=float(sum(collected["hip_visibility"]) / len(collected["hip_visibility"])),
+            neck_ratio=float(sum(collected["neck_ratio"]) / len(collected["neck_ratio"])),
         )
         self.finished.emit(result)
 
@@ -636,6 +640,7 @@ class OnboardingWizard(QWizard):
                     "mid_shoulder_y": metrics.mid_shoulder_y,
                     "shoulder_width": metrics.shoulder_width,
                     "hip_visibility": metrics.hip_visibility,
+                    "neck_ratio": metrics.neck_ratio,
                     "sample_count": metrics.sample_count,
                     "calibrated": True,
                 }

@@ -278,6 +278,12 @@ class PoseDetector:
             "spine_alignment_score": float(spine_alignment_score),
             "mid_shoulder_y": float(mid_shoulder[1]),
             "shoulder_width": float(np.linalg.norm(shoulders[1] - shoulders[0])),
+            # Ear-to-shoulder height over 2D shoulder width: shrinks when the head
+            # juts forward or the upper back rounds. Avoids MediaPipe's noisy z.
+            "neck_ratio": float(
+                (mid_shoulder[1] - mid_ear[1])
+                / (np.linalg.norm(shoulders[1][:2] - shoulders[0][:2]) + 1e-6)
+            ),
             "hip_visibility": hip_visibility,
         }
 

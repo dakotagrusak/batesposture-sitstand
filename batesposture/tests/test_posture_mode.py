@@ -1,3 +1,5 @@
+import pytest
+
 from ..services.posture_mode import (
     DeskMode,
     FramingSnapshot,
@@ -59,6 +61,16 @@ def test_score_against_baseline_is_100_when_identical() -> None:
         "posture_score": 40.0,
     }
     assert score_against_baseline(metrics, baseline) == 100.0
+
+
+def test_forward_head_penalizes_shrinking_neck_only() -> None:
+    baseline = coerce_baseline({"neck_ratio": 0.8, "calibrated": True})
+    metrics = {"neck_angle": 10.0, "spine_angle": 10.0, "shoulder_vertical_delta": 0.05}
+    assert score_against_baseline({**metrics, "neck_ratio": 0.8}, baseline) == 100.0
+    assert score_against_baseline({**metrics, "neck_ratio": 0.95}, baseline) == 100.0
+    assert score_against_baseline({**metrics, "neck_ratio": 0.6}, baseline) == pytest.approx(65.0)
+    legacy = coerce_baseline({"calibrated": True})
+    assert score_against_baseline({**metrics, "neck_ratio": 0.1}, legacy) == 100.0
 
 
 def test_presence_emits_left_and_arrived(monkeypatch) -> None:

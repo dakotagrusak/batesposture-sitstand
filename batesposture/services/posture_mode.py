@@ -30,6 +30,7 @@ def default_baseline_dict() -> dict[str, Any]:
         "mid_shoulder_y": 0.45,
         "shoulder_width": 0.25,
         "hip_visibility": 0.0,
+        "neck_ratio": 0.0,  # 0 = not captured (baselines calibrated before this metric)
         "sample_count": 0,
         "calibrated": False,
     }
@@ -139,6 +140,16 @@ def score_against_baseline(metrics: Mapping[str, Any], baseline: Mapping[str, An
     except (TypeError, ValueError):
         return float(metrics.get("posture_score", 0.0) or 0.0)
     penalty = 0.45 * neck + 0.35 * spine + 0.20 * shoulder
+    base_ratio = parsed["neck_ratio"]
+    if base_ratio > 0:
+        try:
+            ratio = float(metrics.get("neck_ratio", base_ratio))
+        except (TypeError, ValueError):
+            ratio = base_ratio
+        # Only shrinking counts: sitting taller than baseline is not a fault.
+        # A 25% drop in ear-to-shoulder height is a full forward-head penalty.
+        forward_head = max(0.0, base_ratio - ratio) / base_ratio / 0.25
+        penalty = 0.65 * penalty + 0.35 * forward_head
     return float(max(0.0, min(100.0, 100.0 * (1.0 - penalty))))
 
 
